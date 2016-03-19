@@ -4,6 +4,7 @@ import "fmt"
 import "unsafe"
 import "strings"
 import "sync"
+import "net"
 
 /*
 
@@ -23,12 +24,18 @@ static int64_t ffz(uint64_t word)
 	return word;
 }
 
+#cgo CFLAGS: -m64 -pthread  -march=native -DRTE_MACHINE_CPUFLAG_SSE -DRTE_MACHINE_CPUFLAG_SSE2 -DRTE_MACHINE_CPUFLAG_SSE3 -DRTE_MACHINE_CPUFLAG_SSSE3 -DRTE_MACHINE_CPUFLAG_SSE4_1 -DRTE_MACHINE_CPUFLAG_SSE4_2 -DRTE_MACHINE_CPUFLAG_AES -DRTE_MACHINE_CPUFLAG_PCLMULQDQ -DRTE_MACHINE_CPUFLAG_AVX -DRTE_MACHINE_CPUFLAG_RDRAND -DRTE_MACHINE_CPUFLAG_FSGSBASE -DRTE_MACHINE_CPUFLAG_F16C -DRTE_MACHINE_CPUFLAG_AVX2 -DRTE_COMPILE_TIME_CPUFLAGS=RTE_CPUFLAG_SSE,RTE_CPUFLAG_SSE2,RTE_CPUFLAG_SSE3,RTE_CPUFLAG_SSSE3,RTE_CPUFLAG_SSE4_1,RTE_CPUFLAG_SSE4_2,RTE_CPUFLAG_AES,RTE_CPUFLAG_PCLMULQDQ,RTE_CPUFLAG_AVX,RTE_CPUFLAG_RDRAND,RTE_CPUFLAG_FSGSBASE,RTE_CPUFLAG_F16C,RTE_CPUFLAG_AVX2 -I/home/user/dpdk_install/share/dpdk/x86_64-native-linuxapp-gcc/include -include /home/user/dpdk_install/share/dpdk/x86_64-native-linuxapp-gcc/include/rte_config.h
+
 #cgo LDFLAGS: -L. -ldpdk -Wl,--no-as-needed -export-dynamic -L/home/user/dpdk_install/share/dpdk//x86_64-native-linuxapp-gcc/lib  -L/home/user/dpdk_install/share/dpdk//x86_64-native-linuxapp     -gcc/lib -Wl,--whole-archive -lrte_distributor -lrte_reorder -lrte_kni -lrte_pipeline -lrte_table -lrte_port -lrte_timer -lrte_hash -lrte_jobstats -lrte_lpm -lrte_power -lrte_acl -lrte_meter -lrte_sched -lm -lrt -lrte_vhost -Wl,--start-group -lrte_kvargs -lrte_mbuf -lrte_mbuf_offload -lrte_ip_frag -lethdev -lrte_cryptodev -lrte_mempool -lrte_ring -lrte_eal -lrte_cmdline -lrte_cfgfile -lrte_pmd_bond -lrte_pmd_vmxnet3_uio -lrte_pmd_virtio -lrte_pmd_cxgbe -lrte_pmd_enic -lrte_pmd_i40e -lrte_pmd_fm10k -lrte_pmd_ixgbe -lrte_pmd_e1000 -lrte_pmd_ring -lrte_pmd_af_packet -lrte_pmd_null -lrt -lm -ldl -Wl,--end-group -Wl,--no-whole-archive -lpthread
+
 */
 import "C"
 
 // Path where vhost user socket are created 
 const VrouterVarPath = "/var/run/vrouter/"
+
+// Number of Virtual Routing Instances
+const NbVrfEntries = 64 * 1024
 
 /* -------------------------------------------------------------------------
  *  Bitmap support
@@ -261,14 +268,55 @@ func dpdk_init() {
     defer DpdkInit_Sync.Done()
 }
 
+
+//export ProxyPacketHandler
+func ProxyPacketHandler(pkt unsafe.Pointer, l C.int) (C.int){
+    var buf [512]byte
+    pkt_data := C.GoBytes(pkt, l)
+
+    conn, err := net.DialUnix("unix", nil, &net.UnixAddr{"/var/run/vrouter/dhcpd.socket", "unix"})
+    if err != nil {
+        fmt.Printf("Failed to connect to DHCP server\n")
+        return C.int(-1)
+    }
+
+    fmt.Printf("[Sending %d bytes to DHCP server]\n", l)
+
+    // Write VRF Label
+    conn.Write([]byte{'0'})
+
+    // Write the packets
+    conn.Write(pkt_data)
+
+    // Wait for response from DHCP server
+    n,err := conn.Read(buf[:])
+    if err != nil {
+        fmt.Printf("Failed to get response from DHCP server\n")
+        conn.Close()
+        return C.int(-2)
+    }
+
+    // Copy the reponse to RTE buffer
+    C.memcpy(pkt, unsafe.Pointer(&buf[0]), C.size_t(n));
+
+    // Close the connection
+    conn.Close()
+
+    fmt.Printf("[Received %d bytes]\n", n)
+    return C.int(n)
+}
+
 func main() {
     // Init dodk
     DpdkInit_Sync.Add(1)
     go dpdk_init()
     DpdkInit_Sync.Wait()
-    
+
     lcores := C.GetCoreCount()
     fmt.Printf("VROUTER: %d cores found\n", lcores)
+
+    // IPV4 routing
+    C.ipv4_route_init(NbVrfEntries)
 
     // Initialize the event handler module 
     EventHandlerInit(uint(lcores))
@@ -277,7 +325,8 @@ func main() {
 	VifInit(uint(lcores))
 
 	cpusets := []int32{0}
-	VifAdd("vif-1", [4]byte{192, 168, 1, 1}, 32, [6]byte{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x3c}, 0, cpusets)
+	VifAdd("vif-1", [4]byte{192, 168, 1, 9}, 32, [6]byte{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x3c}, 0, cpusets)
+	VifAdd("vif-2", [4]byte{192, 168, 1, 10}, 32, [6]byte{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x3d}, 0, cpusets)
 
     var wait sync.WaitGroup
 
@@ -285,3 +334,4 @@ func main() {
     wait.Wait()
 	VifDel("vif-1")
 }
+

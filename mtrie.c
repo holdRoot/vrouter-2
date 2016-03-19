@@ -28,8 +28,53 @@ int mtrie_init(mtrie_t* mtrie, uint8_t maxLevel)
     mutex_init(&mtrie->lock);
     mtrie->root = NULL;
     mtrie->maxLevel = maxLevel;
+    mtrie->ops_root = NULL;
     return 0;
 }
+
+// Stores the ops data in a stack
+static int mtrie_ops_stack_push(mtrie_t* mtrie, mtrie_node_t** address, mtrie_node_t* value, mtrie_node_t* node, void *data)
+{
+    struct mtrie_ops_stack_node *onode = MALLOC(struct mtrie_ops_stack_node);
+    if (!onode)
+        return -EAGAIN;
+
+    onode->address = address;
+    onode->node = node;
+    onode->value = value;
+    onode->data = data;
+    onode->next = mtrie->ops_root;
+    mtrie->ops_root = onode;
+
+    return 0;
+}
+
+// pops a ops data from stack
+static struct mtrie_ops_stack_node* mtrie_ops_stack_pop(mtrie_t* mtrie)
+{
+    struct mtrie_ops_stack_node *onode = NULL;
+
+    if (mtrie->ops_root) {
+        onode = mtrie->ops_root;
+        mtrie->ops_root = onode->next;
+    }
+
+    return onode;
+}
+
+// Used in error conditions
+#if 0
+static void mtrie_ops_stack_free(mtrie_t* mtrie)
+{
+    struct mtrie_ops_stack_node *onode = NULL;
+
+    while (mtrie->ops_root) {
+        onode = mtrie->ops_root->next;
+        free(mtrie->ops_root);
+        mtrie->ops_root = onode;
+    }
+}
+#endif
 
 static mtrie_node_t* get_new_mtrie_node(void)
 {
@@ -53,18 +98,18 @@ static mtrie_node_t* get_new_mtrie_leaf_node(void)
     return node;
 }
 
+#if 0 // Uncomment when hard delete logic is added. 
 static void free_node(mtrie_node_t* node)
 {
     free(node);
 }
+#endif
 
 int mtrie_add_entry(mtrie_t* mtrie, uint8_t* prefix, int prefixLen, void* data)
 {
     int ret = 0;
     int l;
     mtrie_node_t* node;
-    // ipv4 has only 4 octects
-    mtrie_node_t *store[4];
 
     WARN_ON(mtrie != NULL);
     WARN_ON(prefixLen >= 0);
@@ -79,59 +124,52 @@ int mtrie_add_entry(mtrie_t* mtrie, uint8_t* prefix, int prefixLen, void* data)
      * we build the mtrie from bottom-up way. so that no dangling pointers. */
     node = mtrie->root;
     for (l = 0; l <= mtrie->maxLevel; l++) {
-        /* Wildcard */
-        if (BITS_PER_LEVEL > prefixLen) {
-            uint8_t index = prefix[l] & ~( (1u << (BITS_PER_LEVEL - prefixLen) ) - 1u);
-            int j;
+        uint8_t index = prefix[l] & ( (1u << BITS_PER_LEVEL) - 1u);
+        mtrie_node_t* tmpNode;
 
-            /* Fill the information for wildcard entries */
-            for (j = index; j < LEVEL_SIZE; j++) {
-                if (node->childs[j] == NULL) {
-                    if (l == mtrie->maxLevel)
-                        node->childs[j] = get_new_mtrie_leaf_node();
-                    else
-                        node->childs[j] = get_new_mtrie_node();
-                    node->numChilds++;
-                }
+        if (l == mtrie->maxLevel) {
+            if (node->childs[index])
+                printf("Possible case of route overwrite!");
 
-                /* Overwrites existing data */
-                node->childs[j]->data = data;
-            }
-
-            /* Stop the loop, as all valid and wildcard bits are processed */
-            break;
+            tmpNode = get_new_mtrie_leaf_node();
+            WARN_ON(tmpNode != NULL);
+            tmpNode->data = data;
+            mtrie_ops_stack_push(mtrie, &node->childs[index], tmpNode, node, NULL);
         }
         else {
-            uint8_t index = prefix[l] & ( (1u << BITS_PER_LEVEL) - 1u);
+            if (node->childs[index] == NULL) {
+                mtrie_node_t* tmpNode = get_new_mtrie_node();
+                WARN_ON(tmpNode != NULL);
+                mtrie_ops_stack_push(mtrie, &node->childs[index], tmpNode, node, NULL);
 
-            if (l == mtrie->maxLevel) {
-                node->childs[index] = get_new_mtrie_leaf_node();
-                node->childs[index]->data = data;
-                node->numChilds++;
+                node = tmpNode;
             }
             else {
-                if (node->childs[index] == NULL) {
-                    mtrie_node_t* tmpNode = get_new_mtrie_node();
-                    WARN_ON(tmpNode != NULL);
-                    node->numChilds++;
-                    node->childs[index] = tmpNode;
-                    node = tmpNode;
-                }
-                else {
-                    node = node->childs[index];
-                }
+                node = node->childs[index];
+            }
 
-                prefixLen -= BITS_PER_LEVEL;
+            prefixLen -= BITS_PER_LEVEL;
 
-                /* prefixLen is multiple of BITS_PER_LEVEL */
-                if (prefixLen == 0) {
-                    node->data = data;
-                    break;
-                }
+            /* prefixLen is multiple of BITS_PER_LEVEL */
+            if (prefixLen == 0) {
+                node->data = data;
+                break;
             }
         }
     }
-        
+
+    // Building in bottom to up fashion, helps in protection from race-conditions.
+    // Process the ops stack
+    while (mtrie->ops_root) {
+        struct mtrie_ops_stack_node* onode = mtrie_ops_stack_pop(mtrie);
+        onode->node->numChilds++;
+        onode->node->data = onode->data;
+        // Let above writes complete from we plug the entry in mtrie.
+        __sync_synchronize();
+        (*onode->address) = onode->value;
+        free(onode);
+    }
+
     mutex_unlock(&mtrie->lock);
 
     return ret;
@@ -149,13 +187,11 @@ static mtrie_node_t* __mtrie_del_entry(mtrie_node_t* node, int maxLevel, int lev
 
             index = prefix[level] & ~( (1u << (BITS_PER_LEVEL - prefixLen) ) - 1u);
             j = index;
-
             for ( ; j < LEVEL_SIZE; j++) {
                 if (node->childs[j]) {
                     /* recurse into the next level of entries */
                     ret = __mtrie_del_entry(node->childs[j], maxLevel, level + 1, prefix, 0);
                     if (ret == NULL)  node->numChilds--;
-                    node->childs[j] = ret;
                 }
             }
         }
@@ -165,7 +201,6 @@ static mtrie_node_t* __mtrie_del_entry(mtrie_node_t* node, int maxLevel, int lev
                 ret = __mtrie_del_entry(node->childs[index], maxLevel, level + 1,
                         prefix, prefixLen -= BITS_PER_LEVEL);
                 if (ret == NULL)  node->numChilds--;
-                node->childs[index] = ret;
             }
             else {
                 __error("Failed to find the prefix in mtrie table\n");
@@ -175,7 +210,9 @@ static mtrie_node_t* __mtrie_del_entry(mtrie_node_t* node, int maxLevel, int lev
     }
 
     if (node->numChilds == 0) {
-        free_node(node);
+        node->data = NULL;
+        // we actually don't delete the node. we keep it for re-use.
+        // Only make the data points to NULL. This we are safe from race-conditions.
         return NULL;
     }
 
@@ -205,26 +242,19 @@ out:
     return ret;
 }
 
-void* mtrie_lookup(mtrie_t* mtrie, uint8_t* prefix, int prefixLen)
+
+// Called from fast path (no lock taken)
+void* mtrie_lookup(mtrie_t* mtrie, uint8_t* prefix, CC_UNUSED int prefixLen)
 {
-    int l;
     mtrie_node_t* node;
     void* data = NULL;
-
-    WARN_ON(mtrie != NULL);
-    WARN_ON(prefixLen >= 0);
-
-    mutex_lock(&mtrie->lock);
-
-    if (mtrie->root == NULL) {
-        goto out;
-    }
+    int l;
 
     node = mtrie->root;
-    for (l = 0; l <= mtrie->maxLevel; l++) {
+    for (l = 0; likely(l <= mtrie->maxLevel); l++) {
         uint8_t index = prefix[l] & ( (1u << BITS_PER_LEVEL) - 1u);
-        if (node->childs[index]) {
-            if (node->childs[index]->data != NULL) {
+        if (likely(node->childs[index] != NULL)) {
+            if (likely(node->childs[index]->data != NULL)) {
                 data = node->childs[index]->data;
             }
             node = node->childs[index];
@@ -233,9 +263,7 @@ void* mtrie_lookup(mtrie_t* mtrie, uint8_t* prefix, int prefixLen)
             break;
     }
 
-out:
-    mutex_unlock(&mtrie->lock);
-
     return data;
 }
 
+// TODO: Implement hard delete logic. which deletes the complete trie.

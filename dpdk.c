@@ -21,33 +21,6 @@
 #include <poll.h>
 #include <unistd.h>
 
-/* DPDK Include files */
-#include <rte_common.h>
-#include <rte_vect.h>
-#include <rte_byteorder.h>
-#include <rte_log.h>
-#include <rte_memory.h>
-#include <rte_memcpy.h>
-#include <rte_memzone.h>
-#include <rte_eal.h>
-#include <rte_per_lcore.h>
-#include <rte_cycles.h>
-#include <rte_prefetch.h>
-#include <rte_lcore.h>
-#include <rte_per_lcore.h>
-#include <rte_debug.h>
-#include <rte_ether.h>
-#include <rte_ethdev.h>
-#include <rte_mempool.h>
-#include <rte_mbuf.h>
-#include <rte_ip.h>
-#include <rte_ring.h>
-#include <rte_atomic.h>
-#include <rte_branch_prediction.h>
-#include <rte_virtio_net.h>
-#include <rte_errno.h>
-#include <rte_interrupts.h>
-
 #include "dpdk.h"
 #include "mtrie.h"
 
@@ -67,13 +40,10 @@
 /* Memory pool cache size */
 #define MEMPOOL_CACHE_SIZE (256u)
 
-/* Maximum number of packets in a burst */
-#define MAX_PKT_BURST (32u)
-
 /* Number of packets to prefetch when rx */
 #define NB_PREFETCH_PACKETS (3)
 
-#define MBUF_SIZE (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
+#define MBUF_SIZE (DEFAULT_PACKET_SZ + sizeof(struct rte_mbuf) + sizeof(struct packet) + RTE_PKTMBUF_HEADROOM)
 
 #define NB_MBUF RTE_MAX	(								\
 				(nb_queues * RTE_RX_DESC_DEFAULT +	\
@@ -186,6 +156,8 @@ static int engine_loop(CC_UNUSED void* arg);
 
 int engine_send_cmd(int lcore_id, void* buf);
 
+static int bcast_pkt_handler(CC_UNUSED void* data, struct packet* pkt);
+
 /* ------------------------------------------------------------------------- *
  * Globals
  * ------------------------------------------------------------------------- *
@@ -223,7 +195,7 @@ static struct rte_ring* lcore_status_ring[RTE_MAX_LCORE];
  */
 #define VIRTIO_MAX_NB_BUF       (4096)
 #define VIRTIO_MIN_NB_BUF       (1024)
-#define VIRTIO_MBUF_SIZE        (2048 + sizeof(struct rte_mbuf) + RTE_PKTMBUF_HEADROOM)
+#define VIRTIO_MBUF_SIZE        (DEFAULT_PACKET_SZ + sizeof(struct rte_mbuf) + sizeof(struct packet) + RTE_PKTMBUF_HEADROOM)
 #define VIRTIO_MP_CACHE_SIZE    (RTE_MEMPOOL_CACHE_MAX_SIZE)
 #define VIRTIO_RX_BURST         (32u)
 
@@ -246,6 +218,7 @@ static pthread_t vhost_thread;
  * APIS
  * ------------------------------------------------------------------------- *
  */
+#if 0
 static void check_all_ports_link_status(uint8_t port_num, uint32_t port_mask)
 {
 #define CHECK_INTERVAL 100 /* 100ms */
@@ -298,6 +271,7 @@ static void check_all_ports_link_status(uint8_t port_num, uint32_t port_mask)
 		}
 	}
 }
+#endif
 
 static void print_ethaddr(const struct ether_addr *eth_addr)
 {
@@ -451,8 +425,6 @@ static int dpdk_main(int port_id, int argc, char* argv[])
             log_crit( "Cannot initialize RX queue (%d)\n", core_id);
             return -ENODEV;
         }
-
-        printf("%d: efd: %d\n", core_id, dev_info.pci_dev->intr_handle.efds[core_id]);
     }
 
     // Start the eth device
@@ -482,19 +454,64 @@ static int dpdk_main(int port_id, int argc, char* argv[])
  * ------------------------------------------------------------------------- *
  */
 
+static int virtio_tx_packet(void* data, struct packet* pkt)
+{
+    struct vif* vif = (struct vif*)pkt->lldev->vif;
+    int q_no = pkt->q_no * VIRTIO_QNUM + VIRTIO_RXQ;
+
+    // TODO: Handle burst mode
+    if (rte_vhost_enqueue_burst(vif->lldev->dev, q_no, &pkt->mbuf, 1) == 1) {
+        rte_atomic64_inc(&vif->tx_packets);
+        rte_atomic64_inc(&vif->lldev->queue[q_no].tx_packets);
+    }
+    else {
+        rte_atomic64_inc(&vif->dropped_packets);
+        rte_atomic64_inc(&vif->lldev->queue[q_no].dropped_packets);
+        printf("virtio_tx_packet Packet dropped\n");
+    }
+        
+}
+
 // Virtio rx event handler
-static void virtio_rx_packet(CC_UNUSED uint16_t lcore_id, CC_UNUSED void* _arg)
+static void virtio_rx_packet(uint16_t lcore_id, void* _arg)
 {
     struct virtio_arg* arg = (struct virtio_arg*)_arg;
-    struct rte_mbuf *pkts[VIRTIO_RX_BURST];
+    uint16_t q_no = (arg->q_no * VIRTIO_QNUM + VIRTIO_TXQ);
+    struct rte_mbuf *rpkts[VIRTIO_RX_BURST];
     unsigned count;
 
     count = rte_vhost_dequeue_burst(arg->lldev->dev,
-                                    (arg->q_no * 2 + VIRTIO_TXQ),
+                                    q_no,
                                     arg->pool,
-                                    pkts,
+                                    rpkts,
                                     VIRTIO_RX_BURST);
-    if (count > 0) {
+    if (likely(count > 0)) {
+        unsigned i;
+
+        for (i = 0; likely(i < count); i++) {
+            struct packet* pkt = cast_packet(rpkts[i], arg->lldev, lcore_id, arg->q_no);
+            struct nexthop* nh;
+
+            if ( likely(pkt->ip_hdr != NULL) ) { //IPv4?
+                uint8_t* ip = (uint8_t*)(&pkt->ip_hdr->dst_addr);
+                printf("finding route for %d.%d.%d.%d found\n", ip[0], ip[1], ip[2], ip[3]);
+                nh = ipv4_lookup(arg->lldev->vif->label, (uint8_t*)&pkt->ip_hdr->dst_addr);
+                if (likely(nh != NULL)) {
+                    pkt->nh = nh;
+                    (*nh->fn)(nh->data, pkt);
+                }
+                else {
+                    uint8_t* ip = (uint8_t*)(&pkt->ip_hdr->dst_addr);
+                    printf("Error: No route to %d.%d.%d.%d found\n", ip[0], ip[1], ip[2], ip[3]);
+                }
+            }
+            else if (ntohs(pkt->ether_hdr->ether_type) == 0x0806) {
+                bcast_pkt_handler(NULL, pkt);
+            }
+            else {
+                rte_pktmbuf_free(rpkts[i]);
+            }
+        }
     }
     else {
         log_crit("virtio_rx_packet: got one rx event without any packets!!\n");
@@ -509,8 +526,6 @@ static int new_device(struct virtio_net *dev)
     GoString str;
     int q_no;
 
-    printf("new_device: %ld\n", dev->device_fh);
-
     pthread_mutex_lock(&ll_virtio_net_lock);
     lldev->dev = dev;
     lldev->next = ll_virtio_net_root;
@@ -520,28 +535,30 @@ static int new_device(struct virtio_net *dev)
 
     lldev->state = VIRTIO_STATE_MAC_LEARNING;
     lldev->nb_queues = dev->virt_qp_nb;
-    lldev->queue = (struct virtqueue*) malloc(sizeof(struct virtqueue) * lldev->nb_queues);
+    lldev->queue = (struct virtqueue*) malloc(sizeof(struct virtqueue) * lldev->nb_queues * VIRTIO_QNUM);
 
     for (q_no = 0; q_no < lldev->nb_queues; q_no++) {
-        lldev->queue[q_no].callfd = dev->virtqueue[q_no * 2 + VIRTIO_RXQ]->callfd;
-        lldev->queue[q_no].kickfd = dev->virtqueue[q_no * 2 + VIRTIO_TXQ]->kickfd;
-        lldev->queue[q_no].rxq = dev->virtqueue[q_no * 2 + VIRTIO_TXQ];
-        lldev->queue[q_no].txq = dev->virtqueue[q_no * 2 + VIRTIO_TXQ];
-        lldev->queue[q_no].rx_packets = 0;
-        lldev->queue[q_no].tx_packets = 0;
-        lldev->queue[q_no].error_packets = 0;
+        lldev->queue[q_no].callfd = dev->virtqueue[q_no * VIRTIO_QNUM + VIRTIO_RXQ]->callfd;
+        lldev->queue[q_no].kickfd = dev->virtqueue[q_no * VIRTIO_QNUM + VIRTIO_TXQ]->kickfd;
+        lldev->queue[q_no].rxq = dev->virtqueue[q_no * VIRTIO_QNUM + VIRTIO_TXQ];
+        lldev->queue[q_no].txq = dev->virtqueue[q_no * VIRTIO_QNUM + VIRTIO_RXQ];
+        rte_atomic64_clear(&lldev->queue[q_no].rx_packets);
+        rte_atomic64_clear(&lldev->queue[q_no].tx_packets);
+        rte_atomic64_clear(&lldev->queue[q_no].dropped_packets);
+        rte_atomic64_clear(&lldev->queue[q_no].error_packets);
         lldev->queue[q_no].entry_read = 0;
+        rte_atomic32_clear(&lldev->queue[q_no].taxi_count);
     }
 
     str.p = dev->ifname;
     str.n = strlen(dev->ifname);
-    printf("Calling VifFind\n");
     vif = VifFind(str, lldev);
-    printf("VifFind: %p\n", vif);
     if (!vif) {
         log_crit("Failed to get associated VIF for this device (%ld)\n", dev->device_fh);
         return -1;
     }
+    lldev->vif = vif;
+    vif->lldev = lldev;
 
     return 0;
 }
@@ -660,7 +677,6 @@ static struct rte_mempool* create_mempool(int core_id, struct virtio_net* dev, i
                 NULL,
                 socketid,
                 0);
-        printf("errno: %d\n", rte_errno);
     } while(!pool && rte_errno == ENOMEM && (mp_size /= 2) >= VIRTIO_MIN_NB_BUF);
 
     return pool;
@@ -705,7 +721,6 @@ int event_handler_add(int core_id, int q_no, int slot, CC_UNUSED void* _vif, voi
     // Send the command to engine loop
     do {
         ret = engine_send_cmd(core_id, (void*)msg);
-        printf("engine_send_cmd: %d\n", ret);
     } while(ret != 0);
 
     free(msg);
@@ -743,7 +758,6 @@ int engine_send_cmd(int lcore_id, void* buf)
     if (rte_ring_full(lcore_cmd_ring[lcore_id]))
         return -EAGAIN;
 
-    printf("Sending one cmd\n");
     rte_ring_sp_enqueue(lcore_cmd_ring[lcore_id], buf);
     write(lcore_cmd_efd[lcore_id], &counter, 8);
 
@@ -759,7 +773,6 @@ int engine_send_cmd(int lcore_id, void* buf)
                 return 0;
             }
             read(lcore_status_efd[lcore_id], &counter, 8);
-            printf("@@revent: %d\n", fds[0].revents);
         }
         else {
             perror("poll");
@@ -779,9 +792,6 @@ static void engine_cmd_callback(uint16_t lcore_id, void* data)
     struct cmd_event_info* info = (struct cmd_event_info*)data;
     struct engine_cmd_msg* msg;
     uint64_t temp;
-
-    // Eat the event
-    //read(lcore_cmd_efd[lcore_id], &temp, 8);
 
     rte_ring_sc_dequeue(lcore_cmd_ring[info->core_id], (void**) &msg);
 
@@ -884,14 +894,16 @@ struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr, uin
         return NULL;
     }
 
-    printf("vif_add called\n");
-
     strcpy(vif->name, name);
     vif->label = label;
     vif->mask = mask;
     memcpy(vif->ip, ip, 4);
     memcpy(vif->macaddr, macaddr, 4);
     strcpy(vif->path, path);
+    rte_atomic64_clear(&vif->rx_packets);
+    rte_atomic64_clear(&vif->tx_packets);
+    rte_atomic64_clear(&vif->dropped_packets);
+    rte_atomic64_clear(&vif->error_packets);
 
     vif->cpus = cpus;
     for (i = 0; i < cpus; i++) {
@@ -899,7 +911,12 @@ struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr, uin
         CPU_SET(cpusets[i], &vif->cpusets[i]);
     }
 
-    vif->dev = NULL;
+    vif->lldev = NULL;
+
+    // Add route to this VM in VRF/RIB.
+    vif->nh.data = vif;
+    vif->nh.fn = virtio_tx_packet;
+    ipv4_route_add(label, ip, &vif->nh);
 
     /* Create VHOST-User socket */
     unlink(vif->path);
@@ -914,6 +931,7 @@ struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr, uin
 // detach a VIF from a vrf
 void vif_del(struct vif* vif)
 {
+    ipv4_route_del(vif->label, vif->ip);
     rte_vhost_driver_unregister(vif->path);
     free(vif);
 }
@@ -930,32 +948,54 @@ unsigned GetCoreCount(void)
  * ------------------------------------------------------------------------- *
  */
 static mtrie_t *ipv4_route_table;
+static struct nexthop bcast_nh;
+
+// Handle BROADCAST packets (ARP, DHCP, etc)
+static int bcast_pkt_handler(CC_UNUSED void* data, struct packet* pkt)
+{
+    uint16_t pkt_size = ProxyPacketHandler(pkt->data, pkt->len);
+
+    pkt->mbuf->pkt_len = pkt_size;
+    pkt->mbuf->data_len = pkt_size;
+
+    virtio_tx_packet(data, pkt);
+}
 
 // Called by go code
 int ipv4_route_init(uint32_t nb_entries)
 {
-    int i;
+    uint32_t i;
+    uint32_t bcast_ip = IPv4(0xff, 0xff, 0xff, 0xff);
     ipv4_route_table = (mtrie_t*) malloc (sizeof(mtrie_t) * nb_entries);
     if (!ipv4_route_table)
         return -EAGAIN;
 
+    bcast_nh.data = NULL;
+    bcast_nh.fn = bcast_pkt_handler;
+
     for (i = 0; i < nb_entries; i++) {
         mtrie_init(&ipv4_route_table[i], 3);
+        ipv4_route_add(i, (uint8_t*)&bcast_ip, &bcast_nh);
     }
+
+    return 0;
 }
 
 // Called by go code
 int ipv4_route_add(uint32_t label, uint8_t* ip, struct nexthop* nh)
 {
+    return mtrie_add_entry(&ipv4_route_table[label], ip, 32, nh);
 }
 
 // Called by go code
 int ipv4_route_del(uint32_t label, uint8_t* ip)
 {
+    return mtrie_del_entry(&ipv4_route_table[label], ip, 32);
 }
 
 // Called from data path
-int ipv4_lookup(uint32_t label, uint8_t* ip)
+void* ipv4_lookup(uint32_t label, uint8_t* ip)
 {
+    return mtrie_lookup(&ipv4_route_table[label], ip, 32);
 }
 

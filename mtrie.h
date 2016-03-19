@@ -6,10 +6,19 @@
 struct mtrie_node_s;
 typedef struct mtrie_node_s mtrie_node_t;
 
+struct mtrie_ops_stack_node {
+    struct mtrie_ops_stack_node *next;
+    struct mtrie_node_s **address;
+    struct mtrie_node_s *value;
+    struct mtrie_node_s *node;
+    void* data;
+};
+
 struct mtrie_s {
     struct mutex lock;
     uint8_t maxLevel;
     mtrie_node_t* root;
+    struct mtrie_ops_stack_node* ops_root;
 };
 
 typedef struct mtrie_s mtrie_t;

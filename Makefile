@@ -21,7 +21,7 @@ test:
 	@echo "Building $@"
 
 clean:
-	rm -fr dpdk.o test build *.so
+	rm -fr dpdk.o test build *.so *.o* .o.*
  
 #ifeq ($(RTE_SDK),)
 #$(error "Please define RTE_SDK environment variable")
