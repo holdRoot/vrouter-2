@@ -201,7 +201,7 @@ func VifInit(lcores uint) {
 }
 
 // Add a new vif entry
-func VifAdd(name string, ip [4]byte, mask byte, macaddr [6]byte, label uint32, cpusets []int32) {
+func VifAdd(name string, ip [4]byte, mask byte, macaddr [6]byte, label uint32, cpusets []int32) (int) {
 	vif := new(Vif)
 	vif.name = name
 	vif.ip = ip
@@ -211,7 +211,14 @@ func VifAdd(name string, ip [4]byte, mask byte, macaddr [6]byte, label uint32, c
 	vif.cpusets = cpusets
 	G_Vif[name] = vif
 
-	// let DPDK engine know about this vif
+	// Send Add ARP Request
+    _, res := SendArpConfig(uint8(CONFIG_CMD_ADDARP), uint8(label), macaddr[:], ip[:])
+    if res == nil {
+        fmt.Printf("Failed to add arp entry for the vif\n")
+        return -1
+    }
+
+    // let DPDK engine know about this vif
 	G_Vif[name].vifp = unsafe.Pointer(C.vif_add(C.CString(name),
 							     (*C.uint8_t)(&ip[0]),
 							     C.uint8_t(mask),
@@ -220,6 +227,7 @@ func VifAdd(name string, ip [4]byte, mask byte, macaddr [6]byte, label uint32, c
 								 C.CString(vif.path),
 								 C.int(len(cpusets)),
 								 (*C.int)(unsafe.Pointer(&cpusets[0]))) )
+    return 0
 }
 
 // Del a vif entry
@@ -227,6 +235,11 @@ func VifDel(name string) {
 	if _,ok := G_Vif[name]; ok {
 		// let DPDK engine know about this vif
 		C.vif_del((*C.struct_vif)(G_Vif[name].vifp))
+        vif := G_Vif[name]
+        _, res := SendArpConfig(uint8(CONFIG_CMD_DELARP), uint8(vif.label), vif.mac_addr[:], vif.ip[:])
+        if res == nil {
+            fmt.Printf("Failed to delete arp entry for the vif\n")
+        }
 		G_Vif[name] = nil
 	} else {
 		fmt.Printf("@@Error: %s named vif not found in Vif database\n", name)
@@ -238,6 +251,7 @@ func (vif *Vif) ProgramEventHandler(lldev unsafe.Pointer) {
 		// Get slot in the evenhandler list for the lcore.
 		slot := GetFreeSlot( uint((*vif).cpusets[i]), unsafe.Pointer(vif))
 		if slot != -1 {
+            C.virtio_dev_fixups(lldev, (*vif).vifp);
 			C.event_handler_add(C.int((*vif).cpusets[i]), C.int(i), C.int(slot), (*vif).vifp, unsafe.Pointer(lldev))
 		} else {
 			fmt.Printf("@@Error: failed to get a free slot in the event handler list for %d core\n", (*vif).cpusets[i])
@@ -268,42 +282,47 @@ func dpdk_init() {
     defer DpdkInit_Sync.Done()
 }
 
+const CONFIG_CMD_ADDVRF = 1
+const CONFIG_CMD_DELVRF = 2
+const CONFIG_CMD_ADDARP = 3
+const CONFIG_CMD_DELARP = 4
 
-//export ProxyPacketHandler
-func ProxyPacketHandler(pkt unsafe.Pointer, l C.int) (C.int){
-    var buf [512]byte
-    pkt_data := C.GoBytes(pkt, l)
+const CONFIG_SERVER_PATH = VrouterVarPath + "./config-server.socket"
+const PP_SERVER_PATH = VrouterVarPath + "./packet-proxy.socket"
 
-    conn, err := net.DialUnix("unix", nil, &net.UnixAddr{"/var/run/vrouter/dhcpd.socket", "unix"})
+func SendBytes2ConfigServer(pkt []byte) (int, []byte){
+    conn, err := net.DialUnix("unix", nil, &net.UnixAddr{CONFIG_SERVER_PATH, "unix"})
     if err != nil {
-        fmt.Printf("Failed to connect to DHCP server\n")
-        return C.int(-1)
-    }
-
-    fmt.Printf("[Sending %d bytes to DHCP server]\n", l)
-
-    // Write VRF Label
-    conn.Write([]byte{'0'})
-
-    // Write the packets
-    conn.Write(pkt_data)
-
-    // Wait for response from DHCP server
-    n,err := conn.Read(buf[:])
-    if err != nil {
-        fmt.Printf("Failed to get response from DHCP server\n")
+        fmt.Printf("Failed to connect to config server\n")
         conn.Close()
-        return C.int(-2)
+        return -1, nil
     }
 
-    // Copy the reponse to RTE buffer
-    C.memcpy(pkt, unsafe.Pointer(&buf[0]), C.size_t(n));
+    // Send the packet
+    conn.Write(pkt)
 
-    // Close the connection
+    // Read the response
+    buf := make([]byte, 128)
+    n, err := conn.Read(buf[:])
+    if err != nil {
+        fmt.Printf ("%s\n", buf)
+        fmt.Printf ("Failed to read reponse from the config server\n")
+        conn.Close()
+        return -1, nil
+    }
+
     conn.Close()
+    return n, buf
+}
 
-    fmt.Printf("[Received %d bytes]\n", n)
-    return C.int(n)
+func SendArpConfig(cmd uint8, vrf_no uint8, mac []byte, ip []byte) (int, []byte) {
+    pkt := make([]byte, 68)
+    pkt[0] = byte(cmd)
+    pkt[1] = byte(vrf_no)
+    copy(pkt[2:8], mac)
+    copy(pkt[8:12], ip)
+
+    return SendBytes2ConfigServer(pkt)
 }
 
 func main() {
@@ -325,8 +344,8 @@ func main() {
 	VifInit(uint(lcores))
 
 	cpusets := []int32{0}
-	VifAdd("vif-1", [4]byte{192, 168, 1, 9}, 32, [6]byte{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x3c}, 0, cpusets)
-	VifAdd("vif-2", [4]byte{192, 168, 1, 10}, 32, [6]byte{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x3d}, 0, cpusets)
+	VifAdd("vif-1", [4]byte{192, 168, 1, 2}, 32, [6]byte{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x3c}, 0, cpusets)
+	VifAdd("vif-2", [4]byte{192, 168, 1, 3}, 32, [6]byte{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x3d}, 0, cpusets)
 
     var wait sync.WaitGroup
 

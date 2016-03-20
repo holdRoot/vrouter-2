@@ -21,6 +21,10 @@
 #include <poll.h>
 #include <unistd.h>
 
+#include <sys/socket.h>
+#include <unistd.h>
+#include <sys/un.h>
+
 #include "dpdk.h"
 #include "mtrie.h"
 
@@ -31,10 +35,10 @@
 /* Number of sockets in NUMA */
 #define NB_SOCKETS  (8u)
 
-/* Number of buffer descriptor for RX */
+/* Number of buffer descriptor for RX for every Q */
 #define RTE_RX_DESC_DEFAULT (128u)
 
-/* Number of buffer descriptor for TX */
+/* Number of buffer descriptor for TX for every Q */
 #define RTE_TX_DESC_DEFAULT (512u)
 
 /* Memory pool cache size */
@@ -43,13 +47,19 @@
 /* Number of packets to prefetch when rx */
 #define NB_PREFETCH_PACKETS (3)
 
-#define MBUF_SIZE (DEFAULT_PACKET_SZ + sizeof(struct rte_mbuf) + sizeof(struct packet) + RTE_PKTMBUF_HEADROOM)
+// Default MBUF Size
+#define MBUF_SIZE (DEFAULT_PACKET_SZ + sizeof(struct rte_mbuf) + \
+        PKTMBUF_PRIV_SZ)
 
+// Maximum number of Qs (32 of HW device, 100 VMs each having 2Qs)
+#define NB_QUEUES           (32 + 10)
+
+// There is one big mempool for every socket.
 #define NB_MBUF RTE_MAX	(								\
-				(nb_queues * RTE_RX_DESC_DEFAULT +	\
-				 nb_queues * MAX_PKT_BURST +			\
-				 nb_queues * RTE_TX_DESC_DEFAULT +	\
-				 nb_queues * MEMPOOL_CACHE_SIZE),		\
+				(NB_QUEUES * RTE_RX_DESC_DEFAULT +	    \
+				 NB_QUEUES * MAX_PKT_BURST +			\
+				 NB_QUEUES * RTE_TX_DESC_DEFAULT +	    \
+				 NB_QUEUES * MEMPOOL_CACHE_SIZE),		\
 				(unsigned)8192)
 
 #define RX_PTHRESH (8u) /**< Default values of RX prefetch threshold reg. */
@@ -118,9 +128,9 @@ static const struct rte_eth_rxconf rx_conf = {
  * ------------------------------------------------------------------------- *
  */
 // Add a new fd to fd list
-#define ENGINE_CMD_FD_ADD       (1u)
+#define ENGINE_CMD_FD_ADD       (0x0deadbe1u)
 // Del a fd from fd list
-#define ENGINE_CMD_FD_DEL       (2u)
+#define ENGINE_CMD_FD_DEL       (0x0deadbe2u)
 
 #define MAX_EVENTS      (64*1024)
 
@@ -133,14 +143,22 @@ struct event_handler {
     void (*fn)(uint16_t lcore_id, void *data);
 };
 
+/* Virtio Callback Arg */
+struct virtio_tx_cbarg {
+    struct virtio_net_ll* lldev;
+    struct rte_mempool* pool;
+    int q_no;
+};
+
+/* Event details */
 struct engine_cmd_msg {
     int cmd;
     int fd;
     int slot;
     struct event_handler handler;
-    int ret_code;
 } __attribute__ ((packed));
 
+/* Passed by the engine loop to install the polling fds */
 struct cmd_event_info {
     uint16_t core_id;
     struct pollfd* fds;
@@ -154,9 +172,13 @@ struct cmd_event_info {
  */
 static int engine_loop(CC_UNUSED void* arg);
 
-int engine_send_cmd(int lcore_id, void* buf);
-
 static int bcast_pkt_handler(CC_UNUSED void* data, struct packet* pkt);
+
+static int relay_packet_to_ppserver(struct packet* pkt);
+
+int engine_send_cmd(int lcore_id, struct engine_cmd_msg* buf);
+
+static int schedule_work(void* (*workfn)(void* data), void *arg);
 
 /* ------------------------------------------------------------------------- *
  * Globals
@@ -178,32 +200,21 @@ static int *rx_event_fd;
  * Inter-core communication support
  * ------------------------------------------------------------------------- *
  */
-// Size of cmd ring
-#define CMD_RING_SZ     (256)
-
 // Eventfd for to-fro IPC.
-static int lcore_cmd_efd[RTE_MAX_LCORE];
-static int lcore_status_efd[RTE_MAX_LCORE];
-
-// Ring buffer for inter-core IPC.
-static struct rte_ring* lcore_cmd_ring[RTE_MAX_LCORE];
-static struct rte_ring* lcore_status_ring[RTE_MAX_LCORE];
+static int lcore_cmd_event_fd[RTE_MAX_LCORE];
 
 /* ------------------------------------------------------------------------- *
  * VIRTIO Device Support
  * ------------------------------------------------------------------------- *
  */
+#if 0
 #define VIRTIO_MAX_NB_BUF       (4096)
 #define VIRTIO_MIN_NB_BUF       (1024)
-#define VIRTIO_MBUF_SIZE        (DEFAULT_PACKET_SZ + sizeof(struct rte_mbuf) + sizeof(struct packet) + RTE_PKTMBUF_HEADROOM)
+#define VIRTIO_MBUF_SIZE        (DEFAULT_PACKET_SZ + sizeof(struct rte_mbuf) + \
+                    sizeof(struct packet) + RTE_PKTMBUF_HEADROOM)
 #define VIRTIO_MP_CACHE_SIZE    (RTE_MEMPOOL_CACHE_MAX_SIZE)
+#endif
 #define VIRTIO_RX_BURST         (32u)
-
-struct virtio_arg {
-    struct virtio_net_ll* lldev;
-    struct rte_mempool* pool;
-    int q_no;
-};
 
 // Lock for linkedlist OPs
 static pthread_mutex_t ll_virtio_net_lock;
@@ -290,7 +301,6 @@ static int dpdk_main(int port_id, int argc, char* argv[])
     unsigned nb_queues;
     FILE* lfile;
     uint8_t core_id;
-    char name[80];
     int ret;
 
     printf("In dpdk_main\n");
@@ -308,41 +318,10 @@ static int dpdk_main(int port_id, int argc, char* argv[])
     }
 
     log_info( "Programming cmd rings now!\n");
-
     rx_event_fd = (int *) malloc(sizeof(int *) * rte_lcore_count());
     if (!rx_event_fd) {
         log_crit("Failed to allocate memory for rx event fd arrays\n");
         return -ENOMEM;
-    }
-
-    // Allocate cmd ring for each core
-    RTE_LCORE_FOREACH(core_id) {
-        sprintf(name, "cmd_ring-%d", core_id);
-        lcore_cmd_ring[core_id] = rte_ring_create(name,
-                                                  CMD_RING_SZ,
-                                                  rte_lcore_to_socket_id(core_id),
-                                                  RING_F_SC_DEQ|RING_F_SP_ENQ);
-        if (!lcore_cmd_ring[core_id]) {
-            log_crit( "Failed to create cmd ring for %d\n", core_id);
-            return -ENOMEM;
-        }
-
-        lcore_cmd_efd[core_id] = eventfd(0, 0);
-    }
-
-    // Allocate status ring for each core
-    RTE_LCORE_FOREACH(core_id) {
-        sprintf(name, "status_ring-%d", core_id);
-        lcore_status_ring[core_id] = rte_ring_create(name,
-                                                  CMD_RING_SZ,
-                                                  rte_lcore_to_socket_id(core_id),
-                                                  RING_F_SC_DEQ|RING_F_SP_ENQ);
-        if (!lcore_status_ring[core_id]) {
-            log_crit( "Failed to create status ring for %d\n", core_id);
-            return -ENOMEM;
-        }
-
-        lcore_status_efd[core_id] = eventfd(0, EFD_SEMAPHORE);
     }
 
     rte_eth_macaddr_get(port_id, &port_eth_addr);
@@ -354,8 +333,10 @@ static int dpdk_main(int port_id, int argc, char* argv[])
     rte_eth_dev_info_get(port_id, &dev_info);
 
     dev_info.pci_dev->intr_handle.type = RTE_INTR_HANDLE_VFIO_MSIX;
-    dev_info.pci_dev->intr_handle.max_intr = dev_info.max_rx_queues+ dev_info.max_tx_queues;
-    ret = rte_intr_efd_enable(&dev_info.pci_dev->intr_handle, dev_info.max_rx_queues);
+    dev_info.pci_dev->intr_handle.max_intr =
+                    dev_info.max_rx_queues + dev_info.max_tx_queues;
+    ret = rte_intr_efd_enable(&dev_info.pci_dev->intr_handle,
+            dev_info.max_rx_queues);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "Failed to enable rx interrupts\n");
     }
@@ -365,7 +346,8 @@ static int dpdk_main(int port_id, int argc, char* argv[])
         rte_exit(EXIT_FAILURE, "Failed to enable interrupts\n");
     }
 
-    ret = rte_eth_dev_configure(port_id, dev_info.max_rx_queues, dev_info.max_tx_queues, &port_conf);
+    ret = rte_eth_dev_configure(port_id, dev_info.max_rx_queues,
+                dev_info.max_tx_queues, &port_conf);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "Failed to configure ethernet device\n");
     }
@@ -386,21 +368,27 @@ static int dpdk_main(int port_id, int argc, char* argv[])
         }
 
         /* Create memory pool */
-        snprintf(s, sizeof(s), "mbuf_pool_%d_%d", socketid, core_id);
-        pktmbuf_pool[socketid] = rte_mempool_create(s,
-                                                    NB_MBUF,
-                                                    MBUF_SIZE,
-                                                    MEMPOOL_CACHE_SIZE,
-                                                    sizeof(struct rte_pktmbuf_pool_private),
-                                                    rte_pktmbuf_pool_init,
-                                                    NULL,
-                                                    rte_pktmbuf_init,
-                                                    NULL,
-                                                    socketid,
-                                                    0);
-        if (!pktmbuf_pool[socketid]) {
-            log_crit( "Cannot init mbuf pool on socket %d\n", socketid);
-            return -ENOMEM;
+        if (pktmbuf_pool[socketid] == NULL) {
+            log_info("Creating mempool on %d of ~%lx bytes\n",
+                            socketid, NB_MBUF * MBUF_SIZE);
+            printf("Creating mempool on %d of ~%lx bytes\n",
+                        socketid, NB_MBUF * MBUF_SIZE);
+            snprintf(s, sizeof(s), "mbuf_pool_%d", socketid);
+            pktmbuf_pool[socketid] = rte_mempool_create(s,
+                                                        NB_MBUF,
+                                                        MBUF_SIZE,
+                                                        MEMPOOL_CACHE_SIZE,
+                                                        PKTMBUF_PRIV_SZ,
+                                                        rte_pktmbuf_pool_init,
+                                                        NULL,
+                                                        rte_pktmbuf_init,
+                                                        NULL,
+                                                        socketid,
+                                                        0);
+            if (!pktmbuf_pool[socketid]) {
+                log_crit( "Cannot init mbuf pool on socket %d\n", socketid);
+                return -ENOMEM;
+            }
         }
 
         /* Setup the TX queue */
@@ -425,6 +413,9 @@ static int dpdk_main(int port_id, int argc, char* argv[])
             log_crit( "Cannot initialize RX queue (%d)\n", core_id);
             return -ENODEV;
         }
+
+        /* Create the event fds for event notification */
+        lcore_cmd_event_fd[core_id] = eventfd(0, 0);
     }
 
     // Start the eth device
@@ -454,10 +445,25 @@ static int dpdk_main(int port_id, int argc, char* argv[])
  * ------------------------------------------------------------------------- *
  */
 
-static int virtio_tx_packet(void* data, struct packet* pkt)
+static int virtio_tx_packet(CC_UNUSED void* data, struct packet* pkt)
 {
+    struct vif* rvif = (struct vif*)data;
     struct vif* vif = (struct vif*)pkt->lldev->vif;
     int q_no = pkt->q_no * VIRTIO_QNUM + VIRTIO_RXQ;
+
+    // VIF can be null, as this function is called from various path.
+    if (rvif && (rvif != vif)) { // Local vm to a local vm
+        // Copy the pkt data to new alloc mbuf.
+        // Try to send the packet to remote q running on same core.
+        // Remote VM may not have same number of queues as TX VM has.
+        if (pkt->q_no > rvif->lldev->dev->virt_qp_nb) {
+            // Send on the first queue.
+            q_no = VIRTIO_RXQ;
+        }
+
+        // TX on Remote VIF
+        vif = rvif;
+    }
 
     // TODO: Handle burst mode
     if (rte_vhost_enqueue_burst(vif->lldev->dev, q_no, &pkt->mbuf, 1) == 1) {
@@ -469,13 +475,13 @@ static int virtio_tx_packet(void* data, struct packet* pkt)
         rte_atomic64_inc(&vif->lldev->queue[q_no].dropped_packets);
         printf("virtio_tx_packet Packet dropped\n");
     }
-        
+    return 0;
 }
 
 // Virtio rx event handler
 static void virtio_rx_packet(uint16_t lcore_id, void* _arg)
 {
-    struct virtio_arg* arg = (struct virtio_arg*)_arg;
+    struct virtio_tx_cbarg* arg = (struct virtio_tx_cbarg*)_arg;
     uint16_t q_no = (arg->q_no * VIRTIO_QNUM + VIRTIO_TXQ);
     struct rte_mbuf *rpkts[VIRTIO_RX_BURST];
     unsigned count;
@@ -489,20 +495,21 @@ static void virtio_rx_packet(uint16_t lcore_id, void* _arg)
         unsigned i;
 
         for (i = 0; likely(i < count); i++) {
-            struct packet* pkt = cast_packet(rpkts[i], arg->lldev, lcore_id, arg->q_no);
+            struct packet* pkt = cast_packet(rpkts[i], arg->lldev, lcore_id,
+                                        arg->q_no);
             struct nexthop* nh;
 
             if ( likely(pkt->ip_hdr != NULL) ) { //IPv4?
-                uint8_t* ip = (uint8_t*)(&pkt->ip_hdr->dst_addr);
-                printf("finding route for %d.%d.%d.%d found\n", ip[0], ip[1], ip[2], ip[3]);
-                nh = ipv4_lookup(arg->lldev->vif->label, (uint8_t*)&pkt->ip_hdr->dst_addr);
+                nh = ipv4_lookup(arg->lldev->vif->label,
+                                    (uint8_t*)&pkt->ip_hdr->dst_addr);
                 if (likely(nh != NULL)) {
                     pkt->nh = nh;
                     (*nh->fn)(nh->data, pkt);
                 }
                 else {
                     uint8_t* ip = (uint8_t*)(&pkt->ip_hdr->dst_addr);
-                    printf("Error: No route to %d.%d.%d.%d found\n", ip[0], ip[1], ip[2], ip[3]);
+                    printf("Error: No route to %d.%d.%d.%d found\n",
+                            ip[0], ip[1], ip[2], ip[3]);
                 }
             }
             else if (ntohs(pkt->ether_hdr->ether_type) == 0x0806) {
@@ -518,12 +525,46 @@ static void virtio_rx_packet(uint16_t lcore_id, void* _arg)
     }
 }
 
+
+/* ------------------------------------------------------------------------- *
+ * VIRTIO Device Support
+ * ------------------------------------------------------------------------- *
+ */
+
+// Called by go code (which is called by a call VifFind from C code)
+void virtio_dev_fixups(void* _l, void* _v)
+{
+    struct virtio_net_ll* lldev = (struct virtio_net_ll*)_l;
+    struct vif* vif = (struct vif*)_v;
+
+    lldev->vif = vif;
+    vif->lldev = lldev;
+}
+
+// Called from the bottom half thread
+static void* virtio_new_device_bh(void *arg)
+{
+    struct virtio_net_ll* lldev = (struct virtio_net_ll*)arg;
+    struct vif* vif;
+    GoString str;
+
+    str.p = lldev->dev->ifname;
+    str.n = strlen(lldev->dev->ifname);
+    vif = VifFind(str, lldev);
+    if (!vif) {
+        log_crit("Failed to get associated VIF for this device (%ld)\n",
+                    lldev->dev->device_fh);
+        return NULL;
+    }
+
+    return NULL;
+}
+
 // Called when a VM starts a vhost-user device
 static int new_device(struct virtio_net *dev)
 {
-    struct virtio_net_ll* lldev = (struct virtio_net_ll*) malloc( sizeof(struct virtio_net_ll) );
-    struct vif* vif;
-    GoString str;
+    struct virtio_net_ll* lldev = (struct virtio_net_ll*)
+                                malloc( sizeof(struct virtio_net_ll) );
     int q_no;
 
     pthread_mutex_lock(&ll_virtio_net_lock);
@@ -533,15 +574,18 @@ static int new_device(struct virtio_net *dev)
     dev->priv = lldev;
     pthread_mutex_unlock(&ll_virtio_net_lock);
 
-    lldev->state = VIRTIO_STATE_MAC_LEARNING;
     lldev->nb_queues = dev->virt_qp_nb;
-    lldev->queue = (struct virtqueue*) malloc(sizeof(struct virtqueue) * lldev->nb_queues * VIRTIO_QNUM);
+    lldev->queue = (struct virtqueue*)
+            malloc(sizeof(struct virtqueue) * lldev->nb_queues * VIRTIO_QNUM);
+
+#define VIRTIO_RXQ_NO(X) ((X) * VIRTIO_QNUM + VIRTIO_RXQ)
+#define VIRTIO_TXQ_NO(X) ((X) * VIRTIO_QNUM + VIRTIO_TXQ)
 
     for (q_no = 0; q_no < lldev->nb_queues; q_no++) {
-        lldev->queue[q_no].callfd = dev->virtqueue[q_no * VIRTIO_QNUM + VIRTIO_RXQ]->callfd;
-        lldev->queue[q_no].kickfd = dev->virtqueue[q_no * VIRTIO_QNUM + VIRTIO_TXQ]->kickfd;
-        lldev->queue[q_no].rxq = dev->virtqueue[q_no * VIRTIO_QNUM + VIRTIO_TXQ];
-        lldev->queue[q_no].txq = dev->virtqueue[q_no * VIRTIO_QNUM + VIRTIO_RXQ];
+        lldev->queue[q_no].callfd = dev->virtqueue[VIRTIO_RXQ_NO(q_no)]->callfd;
+        lldev->queue[q_no].kickfd = dev->virtqueue[VIRTIO_TXQ_NO(q_no)]->kickfd;
+        lldev->queue[q_no].rxq = dev->virtqueue[VIRTIO_TXQ_NO(q_no)];
+        lldev->queue[q_no].txq = dev->virtqueue[VIRTIO_RXQ_NO(q_no)];
         rte_atomic64_clear(&lldev->queue[q_no].rx_packets);
         rte_atomic64_clear(&lldev->queue[q_no].tx_packets);
         rte_atomic64_clear(&lldev->queue[q_no].dropped_packets);
@@ -550,15 +594,18 @@ static int new_device(struct virtio_net *dev)
         rte_atomic32_clear(&lldev->queue[q_no].taxi_count);
     }
 
-    str.p = dev->ifname;
-    str.n = strlen(dev->ifname);
-    vif = VifFind(str, lldev);
-    if (!vif) {
-        log_crit("Failed to get associated VIF for this device (%ld)\n", dev->device_fh);
+    // Link up
+    dev->flags |= VIRTIO_DEV_RUNNING;
+
+    // Schedule the BH for fixups
+    if (schedule_work(virtio_new_device_bh, lldev) < 0) {
+        log_crit("Failed to schedul work for new device (%ld)\n",
+                    dev->device_fh);
+        dev->flags &= ~VIRTIO_DEV_RUNNING;
+        free(lldev->queue);
+        free(lldev);
         return -1;
     }
-    lldev->vif = vif;
-    vif->lldev = lldev;
 
     return 0;
 }
@@ -568,11 +615,21 @@ static void destroy_device(volatile struct virtio_net* dev)
 {
     struct virtio_net_ll *ll_node, *ll_prev;
 
+    dev->flags &= ~VIRTIO_DEV_RUNNING;
+
     pthread_mutex_lock(&ll_virtio_net_lock);
-    for (ll_node = ll_virtio_net_root, ll_prev = NULL; ll_node != NULL; ll_prev = ll_node, ll_node = ll_node->next) {
+    for (ll_node = ll_virtio_net_root, ll_prev = NULL;
+        ll_node != NULL;
+        ll_prev = ll_node, ll_node = ll_node->next) {
         if (ll_node->dev == dev) {
-            ll_prev->next = ll_node->next;
-            free(ll_prev);
+            if (ll_prev == NULL) {
+                ll_virtio_net_root = ll_node->next;
+            }
+            else {
+                ll_prev->next = ll_node->next;
+            }
+            free(ll_node);
+            break;
         }
     }
     pthread_mutex_unlock(&ll_virtio_net_lock);
@@ -583,7 +640,8 @@ static const struct virtio_net_device_ops virtio_ops = {
     .destroy_device = destroy_device
 };
 
-/* rte_vhost_driver_session_start is a blocking call, thus we create another thread and call it from there */
+/* rte_vhost_driver_session_start is a blocking call, thus we create another
+ * thread and call it from there */
 static void* vhost_worker(CC_UNUSED void* arg)
 {
     pthread_detach(pthread_self());
@@ -607,10 +665,16 @@ static void* vhost_worker(CC_UNUSED void* arg)
 // Thus calling dpdk_main in thread
 static void* dpdk_init_worker(CC_UNUSED void* arg)
 {
-    const char *argv[5] = { "vrouter", "-m", HUGEPAGE_MEMORY_SZ, "-w", PCI_DEVICE_BDF};
+    const char *argv[5] = { "vrouter",
+                            "-m", HUGEPAGE_MEMORY_SZ,
+                            "-w", PCI_DEVICE_BDF
+                          };
 
-    if (dpdk_main(0, 5, argv) < 0)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-qual"
+    if (dpdk_main(0, 5, (char**)argv) < 0)
         rte_exit(EXIT_FAILURE, "DPDK Main failed\n");
+#pragma GCC diagnostic pop
 
     return NULL;
 }
@@ -623,7 +687,8 @@ int dpdk_init(void)
 {
     int i;
 
-    engine_start_notify = (sem_t*) malloc(sizeof(sem_t) * sysconf (_SC_NPROCESSORS_CONF));
+    engine_start_notify = (sem_t*)
+                    malloc(sizeof(sem_t) * sysconf (_SC_NPROCESSORS_CONF));
 
     for (i = 0; i < sysconf (_SC_NPROCESSORS_CONF); i++)
         sem_init(&engine_start_notify[i], 0, 0);
@@ -654,8 +719,10 @@ int dpdk_init(void)
     return 0;
 }
 
-
-static struct rte_mempool* create_mempool(int core_id, struct virtio_net* dev, int q_no)
+#if 0
+/* Creates mempool for VIRTIO TXQ */
+static struct rte_mempool* create_mempool(int core_id, struct virtio_net* dev,
+                                    int q_no)
 {
     unsigned socketid = rte_lcore_to_socket_id(core_id);
     struct rte_mempool *pool;
@@ -677,25 +744,32 @@ static struct rte_mempool* create_mempool(int core_id, struct virtio_net* dev, i
                 NULL,
                 socketid,
                 0);
-    } while(!pool && rte_errno == ENOMEM && (mp_size /= 2) >= VIRTIO_MIN_NB_BUF);
+    } while(!pool &&
+        rte_errno == ENOMEM &&
+        (mp_size /= 2) >= VIRTIO_MIN_NB_BUF);
 
     return pool;
 }
+#endif
 
-
-int event_handler_add(int core_id, int q_no, int slot, CC_UNUSED void* _vif, void* _lldev)
+/* ------------------------------------------------------------------------- *
+ * EVENT Handler
+ * ------------------------------------------------------------------------- *
+ */
+int event_handler_add(int lcore_id, int q_no, int slot, CC_UNUSED void* _vif,
+        void* _lldev)
 {
-    struct virtio_net_ll* lldev = (struct virtio_net_ll*)_lldev; 
+    struct virtio_net_ll* lldev = (struct virtio_net_ll*)_lldev;
     struct engine_cmd_msg* msg;
-    struct virtio_arg* arg;
-    int ret;
+    struct virtio_tx_cbarg *arg;
+    unsigned socket_id;
 
     msg = (struct engine_cmd_msg*) malloc(sizeof(*msg));
     if (!msg)
         return -EAGAIN;
 
-    arg = (struct virtio_arg*) malloc(sizeof(struct virtio_arg));
-    if (!arg) {
+    arg = (struct virtio_tx_cbarg*) malloc(sizeof(*arg));
+    if (!msg) {
         free(msg);
         return -EAGAIN;
     }
@@ -703,32 +777,23 @@ int event_handler_add(int core_id, int q_no, int slot, CC_UNUSED void* _vif, voi
     msg->cmd = ENGINE_CMD_FD_ADD;
     msg->fd = lldev->queue[q_no].kickfd;
     msg->slot = slot;
-    // Event handler for rx packet event
     arg->lldev = lldev;
     arg->q_no = q_no;
     msg->handler.data = arg;
     msg->handler.fn = virtio_rx_packet;
-    msg->ret_code = -1;
 
-    // Create the rte mempool
-    arg->pool = create_mempool(core_id, lldev->dev, q_no);
-    if (!arg->pool) {
-        free(arg);
-        free(msg);
-        return -EAGAIN;
-    }
+    // Create the rte mempool assocation.
+    socket_id = rte_lcore_to_socket_id(lcore_id);
+    lldev->queue[q_no].pool = pktmbuf_pool[socket_id];
+    arg->pool = pktmbuf_pool[socket_id];
 
-    // Send the command to engine loop
-    do {
-        ret = engine_send_cmd(core_id, (void*)msg);
-    } while(ret != 0);
+    // Send the event to the engine loop thread
+    eventfd_write(lcore_cmd_event_fd[lcore_id], (eventfd_t)(uintptr_t)msg);
 
-    free(msg);
-
-    return msg->ret_code;
+    return 0;
 }
 
-int event_handler_del(int core_id, int slot)
+int event_handler_del(int lcore_id, int slot)
 {
     struct engine_cmd_msg* msg;
 
@@ -738,49 +803,9 @@ int event_handler_del(int core_id, int slot)
 
     msg->cmd = ENGINE_CMD_FD_DEL;
     msg->slot = slot;
-    msg->ret_code = -1;
 
-    // Send the command to engine loop
-    while (engine_send_cmd(core_id, (void*)msg) != 0);
-
-    free(msg);
-
-    return msg->ret_code;
-}
-
-/* Send a command to an engine loop */
-int engine_send_cmd(int lcore_id, void* buf)
-{
-    uint64_t counter = 1;
-    struct pollfd fds[1];
-    int ret;
-
-    if (rte_ring_full(lcore_cmd_ring[lcore_id]))
-        return -EAGAIN;
-
-    rte_ring_sp_enqueue(lcore_cmd_ring[lcore_id], buf);
-    write(lcore_cmd_efd[lcore_id], &counter, 8);
-
-    // Wait for status notify
-    fds[0].events = POLLIN|POLLERR;
-    fds[0].fd = lcore_status_efd[lcore_id];
-
-    do {
-        ret = poll(&fds[0], 1, -1);
-        if (ret > 0) {
-            if (fds[0].revents & POLLIN) {
-                read(lcore_status_efd[lcore_id], &counter, 8);
-                return 0;
-            }
-            read(lcore_status_efd[lcore_id], &counter, 8);
-        }
-        else {
-            perror("poll");
-            printf("poll return code: %d\n", ret);
-            printf("errnno: %d\n", errno);
-            return -EAGAIN;
-        }
-    } while(1);
+    // Send the event to the engine loop thread
+    eventfd_write(lcore_cmd_event_fd[lcore_id], (eventfd_t)(uintptr_t)msg);
 
     return 0;
 }
@@ -791,54 +816,58 @@ static void engine_cmd_callback(uint16_t lcore_id, void* data)
 {
     struct cmd_event_info* info = (struct cmd_event_info*)data;
     struct engine_cmd_msg* msg;
-    uint64_t temp;
 
-    rte_ring_sc_dequeue(lcore_cmd_ring[info->core_id], (void**) &msg);
+    eventfd_read(lcore_cmd_event_fd[lcore_id], (eventfd_t*) &msg);
 
     if (msg->cmd == ENGINE_CMD_FD_ADD) {
         memset(&info->fds[msg->slot], 0, sizeof(struct pollfd));
-        info->fds[msg->slot].fd = msg->fd;
-        info->fds[msg->slot].events = POLLIN|POLLERR;
-        info->event_handlers[msg->slot].fn = msg->handler.fn;
         info->event_handlers[msg->slot].data = msg->handler.data;
+        info->event_handlers[msg->slot].fn = msg->handler.fn;
+        info->fds[msg->slot].events = POLLIN|POLLERR;
+        info->fds[msg->slot].fd = msg->fd;
         (*info->nb_fd)++;
+        free(msg);
     }
-    else {
+    else if (msg->cmd == ENGINE_CMD_FD_DEL) {
+        void* arg = info->event_handlers[msg->slot].data;
         memset(&info->fds[msg->slot], 0, sizeof(struct pollfd));
         (*info->nb_fd)--;
+        free(arg);
+        free(msg);
     }
-
-    msg->ret_code = 0;
-    write(lcore_status_efd[lcore_id], &temp, 8);
+    else {
+        log_crit("Unrecongnized command received\n");
+        free(msg);
+    }
 }
-
-// RX packet callback
 
 static int engine_loop(CC_UNUSED void* arg)
 {
     uint16_t lcore_id = rte_lcore_id();
-//    struct rte_eth_dev_info* dev_info = (struct rte_eth_dev_info*)arg;
     struct event_handler* event_handlers;
     struct cmd_event_info info;
     struct pollfd* event_fds;
-    uint64_t temp;
     int event_nb_fd;
+    eventfd_t temp;
 
     log_info( "DPDK Engine loop starting on (%d) core\n", lcore_id);
 
     // Notify we are up!
     sem_post(&engine_start_notify[lcore_id]);
 
-    event_handlers = (struct event_handler*)malloc(sizeof(struct event_handler) * MAX_EVENTS);
+    event_handlers = (struct event_handler*)
+                        malloc(sizeof(struct event_handler) * MAX_EVENTS);
     if (!event_handlers) {
-        log_crit( "Engineloop%d: Unable to allocate memory event handlers\n", lcore_id);
+        log_crit( "Engineloop%d: Unable to allocate memory event handlers\n",
+            lcore_id);
         return 0;
     }
     memset(event_handlers, 0, sizeof(struct event_handler) * MAX_EVENTS);
 
     event_fds = (struct pollfd*) malloc(sizeof(struct pollfd) * MAX_EVENTS);
     if (!event_fds) {
-        log_crit( "Engineloop%d: Unable to allocate memory pollfds\n", lcore_id);
+        log_crit( "Engineloop%d: Unable to allocate memory pollfds\n",
+                        lcore_id);
         return 0;
     }
     memset(event_fds, 0, sizeof(struct pollfd) * MAX_EVENTS);
@@ -848,13 +877,13 @@ static int engine_loop(CC_UNUSED void* arg)
     info.fds = event_fds;
     info.nb_fd = &event_nb_fd;
     info.event_handlers = event_handlers;
-    event_handlers[CMD_EVENT_SLOT].data = (void*)&info;
-    event_handlers[CMD_EVENT_SLOT].fn = engine_cmd_callback;
 
     // fds is dynamically modified for new fds.
-    event_fds[CMD_EVENT_SLOT].fd = lcore_cmd_efd[lcore_id];
+    event_handlers[CMD_EVENT_SLOT].data = (void*)&info;
+    event_handlers[CMD_EVENT_SLOT].fn = engine_cmd_callback;
+    event_fds[CMD_EVENT_SLOT].fd = lcore_cmd_event_fd[lcore_id];
     event_fds[CMD_EVENT_SLOT].events = POLLIN | POLLERR;
-    event_nb_fd = 1;
+    event_nb_fd = 1; // Initial number of fds
 
     while(1) {
         int ret = poll(event_fds, event_nb_fd, -1);
@@ -869,10 +898,14 @@ static int engine_loop(CC_UNUSED void* arg)
             for (fd = 0; likely ((fd < event_nb_fd) && (cc < ret)) ; fd++) {
                 if ( likely(event_fds[fd].revents & POLLIN) ) {
                     if ( likely(event_handlers[fd].fn != NULL) ) {
-                        (*event_handlers[fd].fn)(lcore_id, event_handlers[fd].data);
-                        // Reset the event
-                        read(event_fds[fd].fd, &temp, 8);
+                        (*event_handlers[fd].fn)(lcore_id,
+                                event_handlers[fd].data);
                     }
+                    // Read the eventfd
+                    if ( likely(fd != CMD_EVENT_SLOT) ) {
+                        eventfd_read(event_fds[fd].fd, &temp);
+                    }
+                    event_fds[fd].revents = 0;
                     cc++;
                 }
             }
@@ -885,7 +918,8 @@ static int engine_loop(CC_UNUSED void* arg)
 /* -- */
 
 // Attach a VIF to a vrf
-struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr, uint32_t label, char* path, int cpus, int cpusets[])
+struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr,
+    uint32_t label, char* path, int cpus, int cpusets[])
 {
     int i;
     struct vif* vif = (struct vif*) malloc (sizeof(struct vif));
@@ -953,12 +987,19 @@ static struct nexthop bcast_nh;
 // Handle BROADCAST packets (ARP, DHCP, etc)
 static int bcast_pkt_handler(CC_UNUSED void* data, struct packet* pkt)
 {
-    uint16_t pkt_size = ProxyPacketHandler(pkt->data, pkt->len);
+    int pkt_size = relay_packet_to_ppserver(pkt);
+
+    if (pkt_size <= 0) {
+        rte_pktmbuf_free(pkt->mbuf);
+        log_crit("Invalid response got from pp server\n");
+        return -1;
+    }
 
     pkt->mbuf->pkt_len = pkt_size;
     pkt->mbuf->data_len = pkt_size;
-
     virtio_tx_packet(data, pkt);
+
+    return 0;
 }
 
 // Called by go code
@@ -997,5 +1038,88 @@ int ipv4_route_del(uint32_t label, uint8_t* ip)
 void* ipv4_lookup(uint32_t label, uint8_t* ip)
 {
     return mtrie_lookup(&ipv4_route_table[label], ip, 32);
+}
+
+
+/* --------------- SOCKET ----------------------------- */
+static int send_all(int socket, void *buffer, size_t length)
+{
+    char *ptr = (char*) buffer;
+
+    while (length > 0)
+    {
+        int i = send(socket, ptr, length, 0);
+        if (i < 1) return -1;
+        ptr += i;
+        length -= i;
+    }
+
+    return 1;
+}
+
+static int relay_packet_to_ppserver(struct packet* pkt)
+{
+    struct sockaddr_un addr;
+    uint32_t temp;
+
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        return -1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, "/var/run/vrouter/packet-proxy.socket", sizeof(addr.sun_path)-1);
+
+    if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+        return -1;
+    }
+
+    temp = htonl(pkt->len);
+    if (send_all(sock, (void *)&temp, sizeof(temp)) < 0) {
+        return -1;
+    }
+
+    temp = htonl(pkt->lldev->vif->label);
+    if (send_all(sock, (void *)&temp, sizeof(temp)) < 0) {
+        return -1;
+    }
+
+    if (send_all(sock, (void *)pkt->data, pkt->len) < 0) {
+        return -1;
+    }
+
+    if (recv(sock, &temp, sizeof(uint32_t), MSG_WAITALL) <= 0) {
+        perror("recv1");
+        return -1;
+    }
+
+    if (temp == 0)
+        return -1;
+
+    temp = ntohl(temp);
+    printf("Temp: %d\n", temp);
+
+    if (recv(sock, (void *)pkt->data, temp,  MSG_WAITALL) <= 0) {
+        perror("recv2");
+        return -1;
+    }
+
+    close(sock);
+
+    return temp;
+}
+
+
+/* Bottom half support */
+static int schedule_work(void* (*workfn)(void* data), void *arg)
+{
+    pthread_t th;
+    if (pthread_create(&th, NULL, workfn, arg) < 0) {
+        log_crit("Failed to create work function thread\n");
+        return -1;
+    }
+
+    return 0;
 }
 

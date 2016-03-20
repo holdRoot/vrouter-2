@@ -74,6 +74,7 @@
 
 /* VIRTIO Helper struct */
 struct virtqueue {
+    struct rte_mempool* pool;
     int callfd;
     int kickfd;
     struct vhost_virtqueue* txq;
@@ -87,19 +88,12 @@ struct virtqueue {
     rte_atomic32_t taxi_count;
 };
 
-/* State of the virtio dev */
-enum virtio_state {
-    VIRTIO_STATE_MAC_LEARNING,
-    VIRTIO_STATE_READY
-};
-
 /* Linked-list */
 struct virtio_net_ll {
     struct virtio_net_ll* next;
     struct virtio_net* dev;
     int nb_queues;
     struct virtqueue* queue;
-    enum virtio_state state;
     struct vif* vif;
 };
 
@@ -120,9 +114,10 @@ struct packet {
 };
 
 #define DEFAULT_PACKET_SZ   (2048)
-#define PACKET_PRIV(MBUF)    (struct packet*)(rte_pktmbuf_mtod(MBUF, uint8_t*) + 2048)
-#define ETHER_HEADER(X)  rte_pktmbuf_mtod((X), struct ether_hdr*)
-#define IPV4_HEADER(X)   rte_pktmbuf_mtod_offset((X), struct ipv4_hdr*, sizeof(struct ether_hdr))
+#define PKTMBUF_PRIV_SZ     (sizeof (struct packet))
+#define PACKET_PRIV(MBUF)   (struct packet*)((uint8_t*)(MBUF) + sizeof(struct rte_mbuf))
+#define ETHER_HEADER(X)     rte_pktmbuf_mtod((X), struct ether_hdr*)
+#define IPV4_HEADER(X)      rte_pktmbuf_mtod_offset((X), struct ipv4_hdr*, sizeof(struct ether_hdr))
 
 static inline struct packet* cast_packet(struct rte_mbuf* mbuf, void* lldev, uint16_t lcore_id, int q_no)
 {
@@ -149,7 +144,7 @@ static inline struct packet* cast_packet(struct rte_mbuf* mbuf, void* lldev, uin
  */
 struct nexthop {
     void* data;
-    int (*fn)(void* data, struct packet* pkt); 
+    int (*fn)(void* data, struct packet* pkt);
 };
 
 struct vif {
@@ -179,8 +174,6 @@ int event_handler_add(int core_id, int q_no, int slot, void* _vif, void* _lldev)
 
 int event_handler_del(int core_id, int slot);
 
-int engine_send_cmd(int lcore_id, void* buf);
-
 struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr, uint32_t label, char* path, int cpus, int cpusets[]);
 
 void vif_del(struct vif* vif);
@@ -196,6 +189,8 @@ int ipv4_route_del(uint32_t label, uint8_t* ip);
 void* ipv4_lookup(uint32_t label, uint8_t* ip);
 
 int dhcp_build_reply(uint8_t* pkt);
+
+void virtio_dev_fixups(void* _lldev, void* _vif);
 
 #ifdef DPDK
 /* ------------------------------------------------------------------------- *
