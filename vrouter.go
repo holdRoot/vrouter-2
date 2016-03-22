@@ -31,7 +31,7 @@ static int64_t ffz(uint64_t word)
 */
 import "C"
 
-// Path where vhost user socket are created 
+// Path where vhost user socket are created
 const VrouterVarPath = "/var/run/vrouter/"
 
 // Number of Virtual Routing Instances
@@ -207,7 +207,7 @@ func VifAdd(name string, ip [4]byte, mask byte, macaddr [6]byte, label uint32, c
 	vif.ip = ip
 	vif.mac_addr = macaddr
 	vif.label = label;
-	vif.path = fmt.Sprintf("%s/%s", VrouterVarPath, name) 
+	vif.path = fmt.Sprintf("%s/%s", VrouterVarPath, name)
 	vif.cpusets = cpusets
 	G_Vif[name] = vif
 
@@ -222,8 +222,8 @@ func VifAdd(name string, ip [4]byte, mask byte, macaddr [6]byte, label uint32, c
 	G_Vif[name].vifp = unsafe.Pointer(C.vif_add(C.CString(name),
 							     (*C.uint8_t)(&ip[0]),
 							     C.uint8_t(mask),
-								 (*C.uint8_t)(&macaddr[0]), 
-								 C.uint32_t(label), 
+								 (*C.uint8_t)(&macaddr[0]),
+								 C.uint32_t(label),
 								 C.CString(vif.path),
 								 C.int(len(cpusets)),
 								 (*C.int)(unsafe.Pointer(&cpusets[0]))) )
@@ -265,7 +265,7 @@ func VifFind(path string, lldev unsafe.Pointer) (unsafe.Pointer) {
 	// Last token is the name of vif
 	vif_name := tokens[len(tokens) - 1]
 	if _,ok := G_Vif[vif_name]; ok {
-		G_Vif[vif_name].ProgramEventHandler(lldev)
+		//G_Vif[vif_name].ProgramEventHandler(lldev)
 		return G_Vif[vif_name].vifp
 	}
 	return nil
@@ -337,10 +337,10 @@ func main() {
     // IPV4 routing
     C.ipv4_route_init(NbVrfEntries)
 
-    // Initialize the event handler module 
+    // Initialize the event handler module
     EventHandlerInit(uint(lcores))
 
-    // Initialize the vif module 
+    // Initialize the vif module
 	VifInit(uint(lcores))
 
 	cpusets := []int32{0}
@@ -352,5 +352,9 @@ func main() {
     wait.Add(1)
     wait.Wait()
 	VifDel("vif-1")
+
+	while 1 {
+
+	}
 }
 

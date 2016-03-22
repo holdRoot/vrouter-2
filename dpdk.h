@@ -35,12 +35,6 @@
  * Configurable area
  * ------------------------------------------------------------------------- *
  */
-/* Passed as argument to -m command */
-#define HUGEPAGE_MEMORY_SZ      "128"
-
-/* Whitelisted PCI device */
-#define PCI_DEVICE_BDF          "00:03.0"
-
 /* Maximum number of packets in a burst */
 #define MAX_PKT_BURST (32u)
 
@@ -68,39 +62,10 @@
 #define MALLOCN(T,N)            (T*) malloc(sizeof(T) * (N))
 
 /* ------------------------------------------------------------------------- *
- * VIRTIO Device Support
- * ------------------------------------------------------------------------- *
- */
-
-/* VIRTIO Helper struct */
-struct virtqueue {
-    struct rte_mempool* pool;
-    int callfd;
-    int kickfd;
-    struct vhost_virtqueue* txq;
-    struct vhost_virtqueue* rxq;
-    rte_atomic64_t error_packets;
-    rte_atomic64_t dropped_packets;
-    rte_atomic64_t rx_packets;
-    rte_atomic64_t tx_packets;
-    uint32_t entry_read; /* Temporary area used by mac learning code */
-    struct rte_mbuf *pkts[MAX_PKT_BURST];
-    rte_atomic32_t taxi_count;
-};
-
-/* Linked-list */
-struct virtio_net_ll {
-    struct virtio_net_ll* next;
-    struct virtio_net* dev;
-    int nb_queues;
-    struct virtqueue* queue;
-    struct vif* vif;
-};
-
-/* ------------------------------------------------------------------------- *
  * Packet Structure
  * ------------------------------------------------------------------------- *
  */
+struct virtio_net_ll;
 struct packet {
     struct virtio_net_ll* lldev;
     uint16_t lcore_id;
@@ -138,31 +103,7 @@ static inline struct packet* cast_packet(struct rte_mbuf* mbuf, void* lldev, uin
     return packet;
 }
 
-/* ------------------------------------------------------------------------- *
- * VIF structures
- * ------------------------------------------------------------------------- *
- */
-struct nexthop {
-    void* data;
-    int (*fn)(void* data, struct packet* pkt);
-};
-
-struct vif {
-    struct virtio_net_ll* lldev;
-    cpu_set_t cpusets[32];
-    int cpus;
-    char name[32];
-    uint8_t ip[4];
-    uint8_t macaddr[6];
-    uint8_t mask;
-    uint32_t label;
-    char path[512];
-    rte_atomic64_t error_packets;
-    rte_atomic64_t dropped_packets;
-    rte_atomic64_t rx_packets;
-    rte_atomic64_t tx_packets;
-    struct nexthop nh;
-};
+extern struct rte_mempool *pktmbuf_pool[];
 
 /* ------------------------------------------------------------------------- *
  * APIs
@@ -170,27 +111,7 @@ struct vif {
  */
 int dpdk_init(void);
 
-int event_handler_add(int core_id, int q_no, int slot, void* _vif, void* _lldev);
-
-int event_handler_del(int core_id, int slot);
-
-struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr, uint32_t label, char* path, int cpus, int cpusets[]);
-
-void vif_del(struct vif* vif);
-
 unsigned GetCoreCount(void);
-
-int ipv4_route_init(uint32_t nb_entries);
-
-int ipv4_route_add(uint32_t label, uint8_t* ip, struct nexthop* nh);
-
-int ipv4_route_del(uint32_t label, uint8_t* ip);
-
-void* ipv4_lookup(uint32_t label, uint8_t* ip);
-
-int dhcp_build_reply(uint8_t* pkt);
-
-void virtio_dev_fixups(void* _lldev, void* _vif);
 
 #ifdef DPDK
 /* ------------------------------------------------------------------------- *
@@ -224,4 +145,3 @@ extern void DeleteSlot(GoUint p0, GoInt p1);
 extern void* VifFind(GoString p0, void* p1);
 
 #endif
-
