@@ -1,2 +1,4 @@
 vrouter.go
 vrouter.log
+build/
+*.pyc

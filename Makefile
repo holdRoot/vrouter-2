@@ -15,7 +15,7 @@ SRCS-y := dpdk.c virtio.c virtio_rxtx.c ipv4.c mtrie.c vif.c
 
 USER_FLAGS := -I/usr/include/python2.7
 
-CFLAGS += -O3 $(USER_FLAGS)
+CFLAGS += -ggdb $(USER_FLAGS)
 CFLAGS += $(WERROR_FLAGS)
 
 LDLIBS := -lpython2.7

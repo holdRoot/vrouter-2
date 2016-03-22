@@ -22,8 +22,8 @@
 #include <unistd.h>
 
 #include <sys/socket.h>
-#include <unistd.h>
-#include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "dpdk.h"
 #include "vif.h"
@@ -32,13 +32,16 @@
 
 #include <Python.h>
 
+
+#define NB_VRFS     (64 * 1024) // Support 64k
+
 static PyObject *pName, *pModule;
 
 // Attach a VIF to a vrf
-struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr,
-    uint32_t label, char* path, int cpus, int cpusets[])
+struct vif* vif_add(char* name, uint8_t* ip, uint32_t mask, uint8_t* macaddr,
+    uint32_t label, char* path, uint32_t cpus, int cpusets[])
 {
-    int i;
+    unsigned i;
     struct vif* vif = (struct vif*) malloc (sizeof(struct vif));
     if (!vif) {
         log_crit("Failed to allocated memory for vif struct (%s)\n", name);
@@ -49,7 +52,7 @@ struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr,
     vif->label = label;
     vif->mask = mask;
     memcpy(vif->ip, ip, 4);
-    memcpy(vif->macaddr, macaddr, 4);
+    memcpy(vif->macaddr, macaddr, 6);
     strcpy(vif->path, path);
     rte_atomic64_clear(&vif->rx_packets);
     rte_atomic64_clear(&vif->tx_packets);
@@ -58,8 +61,7 @@ struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr,
 
     vif->cpus = cpus;
     for (i = 0; i < cpus; i++) {
-        CPU_ZERO(&vif->cpusets[i]);
-        CPU_SET(cpusets[i], &vif->cpusets[i]);
+        vif->cpusets[i] = cpusets[i];
     }
 
     vif->lldev = NULL;
@@ -76,6 +78,7 @@ struct vif* vif_add(char* name, uint8_t* ip, uint8_t mask, uint8_t* macaddr,
         return NULL;
     }
 
+    log_crit("%s vif added to the system\n", name);
     return vif;
 }
 
@@ -88,39 +91,64 @@ void vif_del(struct vif* vif)
 }
 
 /* Python bindings */
+static inline uint32_t string_to_uint32(uint8_t *intStr)
+{
+    return (uint32_t)( (intStr[0] << 24) |
+                       (intStr[1] << 16) |
+                       (intStr[2] << 8)  |
+                       intStr[3]);
+}
+
 static PyObject* vifdb_add_notify(CC_UNUSED PyObject* self, PyObject* args)
 {
     char *name;
     uint8_t *ip;
-    uint8_t mask;
+    uint8_t *mask;
     uint8_t *macaddr;
-    uint32_t label;
+    uint8_t *label;
     char *path;
-    int cpus;
+    uint8_t *cpus;
     int cpuset[32];
-    PyObject *pCpuset;
-    int i;
+    uint8_t *pCpuset;
+    unsigned i;
     struct vif* vifp;
+    PyObject* obj;
 
-    if (!PyArg_ParseTuple(args, "ssIsIsio", &name, &ip, &mask,
-        &macaddr, &label, &path, &cpus, &pCpuset)) {
-        Py_RETURN_NONE;
-    }
+    obj = PyTuple_GetItem(args, 0);
+    name = PyString_AsString(obj);
+    obj = PyTuple_GetItem(args, 1);
+    ip = (uint8_t*)PyString_AsString(obj);
+    obj = PyTuple_GetItem(args, 2);
+    mask = (uint8_t*)PyString_AsString(obj);
+    obj = PyTuple_GetItem(args, 3);
+    macaddr = (uint8_t*)PyString_AsString(obj);
+    obj = PyTuple_GetItem(args, 4);
+    label = (uint8_t*)PyString_AsString(obj);
+    obj = PyTuple_GetItem(args, 5);
+    path = PyString_AsString(obj);
+    obj = PyTuple_GetItem(args, 6);
+    cpus = (uint8_t*)PyString_AsString(obj);
+    obj = PyTuple_GetItem(args, 7);
+    pCpuset = (uint8_t*)PyString_AsString(obj);
 
     // Parse the cpsets
-    for (i = 0; i < cpus; i++) {
-        PyObject *obj = PyTuple_GetItem(pCpuset, (Py_ssize_t)i);
-        if (!obj) {
-            Py_RETURN_NONE;
-        }
-        cpuset[i] = (int) PyInt_AsLong(obj);
-        Py_DECREF(obj);
+    for (i = 0; i < *cpus; i++) {
+        cpuset[i] = (int)pCpuset[i];
     }
+
+    printf ("vif_add called: [\n");
+    printf ("\tName: %s\n", name);
+    printf ("\tIP: %x\n", string_to_uint32(ip) );
+    printf ("\tMask: %x\n", string_to_uint32(mask));
+    printf ("\tLabel: %x\n", string_to_uint32(label));
+    printf ("\tCpus: %x\n", string_to_uint32(cpus));
+    printf ("\tPath: %s]\n", path);
 
     Py_DECREF(args);
 
     // Call C vif_add
-    vifp = vif_add(name, ip, mask, macaddr, label, path, cpus, cpuset);
+    vifp = vif_add(name, ip, string_to_uint32(mask), macaddr, \
+                        string_to_uint32(label), path, *cpus, cpuset);
     if (!vifp)
         Py_RETURN_NONE;
 
@@ -147,7 +175,7 @@ static struct PyMethodDef vifdb_notify_methods[] = {
 
 static void PyInit_vifdb_notify(void)
 {
-    Py_InitModule("vifdb_notfy", vifdb_notify_methods);
+    Py_InitModule3("vifdb_notify", vifdb_notify_methods, "VIFDB Notify Helper");
 }
 
 int vif_init(int nb_lcores)
@@ -155,10 +183,15 @@ int vif_init(int nb_lcores)
     PyObject *pFunc;
     PyObject *pArgs, *pValue;
 
-    Py_Initialize();
-    PyImport_AppendInittab("vifdb_notify", &PyInit_vifdb_notify);
+    // Launc threads for each lcore/queue.
+    if (ipv4_route_init(NB_VRFS)) {
+        log_crit("ipv4_route_init failed\n");
+        return -1;
+    }
 
-    pName = PyString_FromString("./scripts/vifdb.py");
+    pName = PyString_FromString("vifdb");
+
+    PyImport_AppendInittab("vifdb_notify", PyInit_vifdb_notify);
 
     // Import the vif_db.py
     pModule = PyImport_Import(pName);
@@ -180,8 +213,38 @@ int vif_init(int nb_lcores)
         }
     }
     else {
-        log_crit("Failed to load ./script/vifdb.py file\n");
+        PyErr_Print();
+        log_crit("Failed to load \'vifdb\' module\n");
+        return -1;
     }
 
     return 0;
 }
+
+void vif_exit(void)
+{
+}
+
+struct vif* vif_find_entry(char *path)
+{
+    PyObject *pFunc;
+    PyObject *pArgs, *pValue;
+
+    pFunc = PyObject_GetAttrString(pModule, "vifdb_find");
+    if (pFunc && PyCallable_Check(pFunc)) {
+        pArgs = PyTuple_New(1);
+        pValue = PyString_FromString(path);
+        PyTuple_SetItem(pArgs, 0, pValue);
+
+        pValue = PyObject_CallObject(pFunc, pArgs);
+        Py_DECREF(pArgs);
+        if (PyCObject_AsVoidPtr(pValue) == NULL) {
+            log_crit("vifdb_init (python) failed\n");
+            return NULL;
+        }
+        return PyCObject_AsVoidPtr(pValue);
+    }
+
+    return NULL;
+}
+

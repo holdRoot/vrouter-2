@@ -20,10 +20,13 @@
 #include <semaphore.h>
 #include <poll.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include "dpdk.h"
 #include "vif.h"
 #include "virtio.h"
+
+#include <Python.h>
 
 /* ------------------------------------------------------------------------- *
  * ETHERDEV Configuration
@@ -206,22 +209,58 @@ static void print_ethaddr(const struct ether_addr *eth_addr)
         eth_addr->addr_bytes[5]);
 }
 
+static sem_t wait_sem;
 static int main_loop(CC_UNUSED void* arg)
 {
-    while(1);
+    sem_wait(&wait_sem);
+
     return 0;
+}
+
+static void vrouter_shutdown(CC_UNUSED int signo)
+{
+    uint16_t nb_cores = rte_lcore_count();
+
+    log_crit("vrouter_shutdown called, shutdowning vrouter\n");
+
+    while (nb_cores-- > 0)
+        sem_post(&wait_sem);
+
+    rte_eth_dev_stop(0);
+
+    virtio_exit();
+
+    vif_exit();
+
+    exit(0);
 }
 
 int main(int argc, char* argv[])
 {
     struct rte_eth_dev_info dev_info;
+    char import_cmd[512];
     unsigned nb_queues;
     FILE* lfile;
     int port_id = 0;
     uint8_t core_id;
     int ret;
 
-    printf("In dpdk_main\n");
+    if (getenv("VROUTER_HOME") == NULL) {
+        printf("Please set VROUTER_HOME variable to point the vrouter "
+            "installtion location\n");
+        exit(0);
+    }
+
+    sem_init(&wait_sem, 0, 0);
+
+    // Python bindings initialization
+    Py_SetProgramName(argv[0]);
+    Py_Initialize();
+    PySys_SetArgv(argc, argv);
+    PyRun_SimpleString("import sys");
+    snprintf(import_cmd, 512, "sys.path.append(\"%s/scripts/\")",
+                        getenv("VROUTER_HOME"));
+    PyRun_SimpleString(import_cmd);
 
     // Open the log file
     lfile = fopen("./vrouter.log", "w");
@@ -235,6 +274,9 @@ int main(int argc, char* argv[])
         return -1;
     }
 
+    signal(SIGINT, vrouter_shutdown);
+    signal(SIGTERM, vrouter_shutdown);
+
     rte_eth_macaddr_get(port_id, &port_eth_addr);
     log_info("Port%d: MAC Address: ", port_id);
     print_ethaddr(&port_eth_addr);
@@ -242,9 +284,10 @@ int main(int argc, char* argv[])
     /* Determine the number of RX/TX pairs supported by NIC */
     rte_eth_dev_info_get(port_id, &dev_info);
 
+#if 0
     dev_info.pci_dev->intr_handle.type = RTE_INTR_HANDLE_VFIO_MSIX;
     dev_info.pci_dev->intr_handle.max_intr =
-                    dev_info.max_rx_queues + dev_info.max_tx_queues;
+                            dev_info.max_rx_queues + dev_info.max_tx_queues;
     ret = rte_intr_efd_enable(&dev_info.pci_dev->intr_handle,
             dev_info.max_rx_queues);
     if (ret < 0) {
@@ -255,6 +298,7 @@ int main(int argc, char* argv[])
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "Failed to enable interrupts\n");
     }
+#endif
 
     ret = rte_eth_dev_configure(port_id, dev_info.max_rx_queues,
                 dev_info.max_tx_queues, &port_conf);
@@ -326,12 +370,14 @@ int main(int argc, char* argv[])
         }
     }
 
+#if 0
     // Start the eth device
     ret = rte_eth_dev_start(port_id);
     if (ret < 0) {
         log_crit( "rte_eth_dev_start: err=%d, port=%d\n", ret, core_id);
         return -ENODEV;
     }
+#endif
 
     // Put the device in promiscuous mode
     rte_eth_promiscuous_enable(port_id);
@@ -339,8 +385,11 @@ int main(int argc, char* argv[])
     // Wait for link up
     //check_all_ports_link_status(1, 1u << port_id);
 
-    // Launc threads for each lcore/queue.
-    vif_init(rte_lcore_count());
+    if (vif_init(rte_lcore_count()) < 0) {
+        log_crit("vif_init failed\n");
+        vrouter_shutdown(0);
+    }
+
     virtio_init();
 
     rte_eal_mp_remote_launch(main_loop, NULL, CALL_MASTER);

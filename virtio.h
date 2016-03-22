@@ -37,3 +37,5 @@ struct virtio_net_ll {
 };
 
 int virtio_init(void);
+
+void virtio_exit(void);

@@ -88,10 +88,7 @@ static int new_device(struct virtio_net *dev)
         return -ENOMEM;
     }
 
-#if 0
-//    str.p = lldev->dev->ifname;
-//    str.n = strlen(lldev->dev->ifname);
-    vif = VifFind(str, lldev);
+    vif = vif_find_entry(lldev->dev->ifname);
     if (!vif) {
         log_crit("Failed to get associated VIF for this device (%ld)\n",
                     lldev->dev->device_fh);
@@ -99,8 +96,6 @@ static int new_device(struct virtio_net *dev)
         free(lldev);
         return -ENODEV;
     }
-#endif
-    vif = NULL;
     lldev->vif = vif;
     vif->lldev = lldev;
 
@@ -116,7 +111,7 @@ static int new_device(struct virtio_net *dev)
         rte_atomic64_clear(&queue->error_packets);
         queue->q_no = q_no;
         queue->notifyfd = eventfd(0, 0);
-        queue->lcore_id = (q_no % vif->cpus);
+        queue->lcore_id = vif->cpusets[(q_no % vif->cpus)];
         queue->lldev = lldev;
 
         // For each TXQ (Guest to Host) Q create a thread
@@ -210,4 +205,9 @@ int virtio_init(void)
     }
 
     return 0;
+}
+
+void virtio_exit(void)
+{
+    pthread_cancel(vhost_thread);
 }
