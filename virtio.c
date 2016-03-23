@@ -192,6 +192,8 @@ int virtio_init(void)
     // Initialize the lock for virtio net linked list
     pthread_mutex_init(&ll_virtio_net_lock, NULL);
 
+    rte_vhost_feature_disable(1ULL << VIRTIO_NET_F_MRG_RXBUF);
+
     // Initialize virtio framework
     if (rte_vhost_driver_callback_register(&virtio_ops) < 0) {
         log_crit( "rte_vhost_driver_callback_register failed\n");

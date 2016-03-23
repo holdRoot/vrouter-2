@@ -33,28 +33,22 @@
  */
 int virtio_tx_packet(CC_UNUSED void* data, struct packet* pkt)
 {
-    struct vif* rvif = (struct vif*)data;
-    struct vif* vif = (struct vif*)pkt->lldev->vif;
-    int q_no = pkt->q_no * VIRTIO_QNUM + VIRTIO_RXQ;
+    struct vif* vif = (struct vif*)data;
+    int q_no = VIRTIO_RXQ; // TODO: Fixme for RSS.
 
-    // VIF can be null, as this function is called from various path.
-    if (rvif && (rvif != vif)) { // Local vm to a local vm
-        // Copy the pkt data to new alloc mbuf.
-        // Try to send the packet to remote q running on same core.
-        // Remote VM may not have same number of queues as TX VM has.
-        if (pkt->q_no > rvif->lldev->dev->virt_qp_nb) {
-            // Send on the first queue.
-            q_no = VIRTIO_RXQ;
-        }
+    if (!pkt->mbuf)
+        rte_panic("Invalid packet received\n");
 
-        // TX on Remote VIF
-        vif = rvif;
+    if (!data && !pkt->lldev)
+        rte_panic("Invalid packet state\n");
+
+    if ( unlikely((data == NULL) && (pkt->lldev->vif != NULL)) ) {
+        vif = pkt->lldev->vif;
     }
 
-    // TODO: Handle burst mode
     if (rte_vhost_enqueue_burst(vif->lldev->dev, q_no, &pkt->mbuf, 1) == 1) {
-        rte_atomic64_inc(&vif->tx_packets);
-        rte_atomic64_inc(&vif->lldev->queue[q_no].tx_packets);
+        rte_atomic64_inc(&vif->rx_packets);
+        rte_atomic64_inc(&vif->lldev->queue[q_no].rx_packets);
     }
     else {
         rte_atomic64_inc(&vif->dropped_packets);
@@ -132,7 +126,7 @@ void* virtio_rx_packet(void* arg)
                             }
                         }
                         else if (ntohs(pkt->ether_hdr->ether_type) == 0x0806) {
-                            bcast_pkt_handler(NULL, pkt);
+                            bcast_pkt_handler(queue->lldev->vif, pkt);
                         }
                         else {
                             rte_pktmbuf_free(rpkts[i]);
