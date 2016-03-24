@@ -47,6 +47,7 @@ struct vif* vif_add(char* name, uint8_t* ip, uint32_t mask, uint8_t* macaddr,
         log_crit("Failed to allocated memory for vif struct (%s)\n", name);
         return NULL;
     }
+    memset(vif, 0, sizeof(struct vif));
 
     strcpy(vif->name, name);
     vif->label = label;

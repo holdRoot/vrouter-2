@@ -36,7 +36,10 @@
  * ------------------------------------------------------------------------- *
  */
 /* Maximum number of packets in a burst */
-#define MAX_PKT_BURST (32u)
+#define MAX_PKT_BURST   (32u)
+
+ /* Maximum number of VCPUs per VM */
+ #define MAX_VCPUS      (8u)
 
 /* ------------------------------------------------------------------------- *
  * Compiler directives

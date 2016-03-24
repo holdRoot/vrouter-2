@@ -11,7 +11,7 @@ include $(RTE_SDK)/mk/rte.vars.mk
 APP = vrouter.exe
 
 # all source are stored in SRCS-y
-SRCS-y := dpdk.c virtio.c virtio_rxtx.c ipv4.c mtrie.c vif.c
+SRCS-y := dpdk.c virtio.c virtio_rxtx.c ipv4.c mtrie.c vif.c lib/vdso_parser.c
 
 USER_FLAGS := -I/usr/include/python2.7
 

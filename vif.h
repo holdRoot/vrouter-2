@@ -11,7 +11,7 @@ struct nexthop {
 
 struct vif {
     struct virtio_net_ll* lldev;
-    uint8_t cpusets[32];
+    uint8_t cpusets[MAX_VCPUS];
     uint32_t cpus;
     char name[32];
     uint8_t ip[4];

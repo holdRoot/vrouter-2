@@ -21,11 +21,12 @@
 #include <poll.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/auxv.h>
 
 #include "dpdk.h"
 #include "vif.h"
 #include "virtio.h"
-
+#include "lib/vdso.h"
 #include <Python.h>
 
 /* ------------------------------------------------------------------------- *
@@ -244,6 +245,14 @@ int main(int argc, char* argv[])
     int port_id = 0;
     uint8_t core_id;
     int ret;
+
+    // The base address of the vDSO (if one exists) is passed by the kernel
+    // to each program in the initial auxiliary vector (see getauxval(3)),
+    // via the AT_SYSINFO_EHDR tag.
+    if (vdso_init() < 0) {
+        printf("Failed to initialize VDSO library\n");
+        return -1;
+    }
 
     if (getenv("VROUTER_HOME") == NULL) {
         printf("Please set VROUTER_HOME variable to point the vrouter "

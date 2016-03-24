@@ -63,15 +63,19 @@ static int new_device(struct virtio_net *dev)
 {
     struct virtio_net_ll* lldev = (struct virtio_net_ll*)
                                         malloc( sizeof(struct virtio_net_ll) );
-    int q_no;
     struct virtqueue* queue;
     struct vif* vif;
-//    GoString str;
+    cpu_set_t* cpusets;
+    unsigned* cpus;
+    unsigned cpu;
+    int q_no, ret = 0;
 
     if (!lldev) {
         log_crit("Failed to allocate memory for lldev\n");
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
+    memset(lldev, 0, sizeof(struct virtio_net_ll));
 
     pthread_mutex_lock(&ll_virtio_net_lock);
     lldev->dev = dev;
@@ -85,21 +89,51 @@ static int new_device(struct virtio_net *dev)
             malloc(sizeof(struct virtqueue) * lldev->nb_queues * VIRTIO_QNUM);
     if (!lldev->queue) {
         log_crit("Failed to allocate memory for lldev's virtqueue\n");
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
+    memset(lldev->queue, 0,
+           sizeof(struct virtqueue) * lldev->nb_queues * VIRTIO_QNUM);
 
     vif = vif_find_entry(lldev->dev->ifname);
     if (!vif) {
         log_crit("Failed to get associated VIF for this device (%ld)\n",
                     lldev->dev->device_fh);
-        free(lldev->queue);
-        free(lldev);
-        return -ENODEV;
+        ret = -ENODEV;
+        goto out1;
     }
     lldev->vif = vif;
     vif->lldev = lldev;
 
+    cpusets = (cpu_set_t*) malloc(lldev->nb_queues * sizeof(cpu_set_t));
+    cpus = (unsigned *) malloc(lldev->nb_queues * sizeof(unsigned));
+    if (!cpusets) {
+        log_crit("Failed to allocate temp memory for cpusets\n");
+        ret = -ENOMEM;
+        goto out1;
+    }
+
+    if (!cpus) {
+        log_crit("Failed to allocate temp memory for cpus\n");
+        ret = -ENOMEM;
+        goto out2;
+    }
+    memset(cpusets, 0, lldev->nb_queues * sizeof(cpu_set_t));
+    memset(cpus, 0, lldev->nb_queues * sizeof(unsigned));
+
+    // Create cpusets for the queues
+    for (cpu = 0; cpu < vif->cpus; cpu++) {
+        for (q_no = 0; q_no < lldev->nb_queues; q_no++) {
+            queue = &lldev->queue[q_no];
+            if ((q_no % vif->cpus) == (cpu % lldev->nb_queues)) {
+                CPU_SET(cpu, &cpusets[q_no]);
+                cpus[q_no] = cpus[q_no] + 1;
+            }
+        }
+    }
+
     for (q_no = 0; q_no < lldev->nb_queues; q_no++) {
+        pthread_attr_t attr;
         queue = &lldev->queue[q_no];
         queue->callfd = dev->virtqueue[VIRTIO_RXQ_NO(q_no)]->callfd;
         queue->kickfd = dev->virtqueue[VIRTIO_TXQ_NO(q_no)]->kickfd;
@@ -111,24 +145,39 @@ static int new_device(struct virtio_net *dev)
         rte_atomic64_clear(&queue->error_packets);
         queue->q_no = q_no;
         queue->notifyfd = eventfd(0, 0);
-        queue->lcore_id = vif->cpusets[(q_no % vif->cpus)];
         queue->lldev = lldev;
 
         // For each TXQ (Guest to Host) Q create a thread
-        if (pthread_create(&queue->txq_thread, NULL, virtio_rx_packet, queue)
+        pthread_attr_init(&attr);
+        pthread_attr_setaffinity_np(&attr, sizeof(cpu_set_t), &cpusets[q_no]);
+        if (pthread_create(&queue->txq_thread, &attr, virtio_rx_packet, queue)
                 != 0) {
             log_crit("Failed to create thread for virtio txq (%ld, %d) \n",
                 dev->device_fh, q_no);
             /* TODO: Cancel all created threads */
-            free(lldev->queue);
-            free(lldev);
-            return -1;
+            pthread_attr_destroy(&attr);
+            ret = -EIO;
+            goto out3;
         }
+        pthread_attr_destroy(&attr);
     }
 
     // Link up
     dev->flags |= VIRTIO_DEV_RUNNING;
-    return 0;
+    return ret;
+
+out3:
+    for ( ; q_no >= 0; q_no--) {
+        pthread_kill(lldev->queue[q_no].txq_thread, SIGTERM);
+        close(lldev->queue[q_no].notifyfd);
+    }
+out2:
+    free(cpusets);
+out1:
+    free(lldev->queue);
+out:
+    free(lldev);
+    return ret;
 }
 
 // Called when a VM destroys a vhost-user device

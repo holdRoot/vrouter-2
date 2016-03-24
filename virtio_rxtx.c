@@ -27,6 +27,9 @@
 #include "virtio_rxtx.h"
 #include "ipv4.h"
 
+// For __vdso_getcpu
+#include "lib/vdso.h"
+
 /* ------------------------------------------------------------------------- *
  * VIRTIO Device Support
  * ------------------------------------------------------------------------- *
@@ -63,23 +66,11 @@ int virtio_tx_packet(CC_UNUSED void* data, struct packet* pkt)
 void* virtio_rx_packet(void* arg)
 {
     struct virtqueue* queue = (struct virtqueue*)arg;
-    struct rte_mempool* pool =
-                pktmbuf_pool[rte_lcore_to_socket_id(queue->lcore_id)];
     int q_no = queue->q_no * VIRTIO_QNUM + VIRTIO_TXQ;
     struct rte_mbuf *rpkts[VIRTIO_RX_BURST];
     struct pollfd fds[2];
     unsigned count;
-    cpu_set_t cpusets;
     eventfd_t temp;
-
-    CPU_ZERO(&cpusets);
-    CPU_SET(queue->lcore_id, &cpusets);
-
-    if (pthread_setaffinity_np(pthread_self(), sizeof(cpusets), &cpusets)
-        != 0) {
-        log_crit("Failed to set CPU affinity for device:queue %ld:%d\n",
-            queue->lldev->dev->device_fh, queue->q_no);
-    }
 
     fds[0].fd = queue->kickfd;
     fds[0].events = POLLIN | POLLERR;
@@ -95,9 +86,15 @@ void* virtio_rx_packet(void* arg)
                 pthread_testcancel();
                 break;
             }
+
             if (fds[0].revents & POLLIN) {
+                unsigned lcore_id, node_id;
+                struct rte_mempool* pool;
+
                 fds[0].revents = 0;
                 eventfd_read(queue->kickfd, &temp);
+                __vdso_getcpu(&lcore_id, &node_id, NULL); // From VDSO
+                pool = pktmbuf_pool[node_id];
                 count = rte_vhost_dequeue_burst(queue->lldev->dev,
                                                 q_no,
                                                 pool,
@@ -108,7 +105,7 @@ void* virtio_rx_packet(void* arg)
 
                     for (i = 0; likely(i < count); i++) {
                         struct packet* pkt = cast_packet(rpkts[i], queue->lldev,
-                            queue->lcore_id, queue->q_no);
+                            lcore_id, queue->q_no);
                         struct nexthop* nh;
 
                         if ( likely(pkt->ip_hdr != NULL) ) { //IPv4?

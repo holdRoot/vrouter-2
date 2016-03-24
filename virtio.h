@@ -10,7 +10,6 @@ struct virtio_net_ll;
 
 /* VIRTIO Helper struct */
 struct virtqueue {
-    struct rte_mempool* pool;
     int callfd;
     int kickfd;
     struct vhost_virtqueue* txq;
@@ -23,7 +22,6 @@ struct virtqueue {
     struct virtio_net_ll* lldev;
     int q_no;
     int notifyfd;
-    int lcore_id;
     int pcore_id;
 };
 

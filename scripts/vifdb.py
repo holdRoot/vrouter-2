@@ -1,7 +1,7 @@
 #!/usr/bin/env python2.7
 
 # Import C extension
-import vifdb_notify
+#import vifdb_notify
 import os, sys, struct, itertools
 
 # Global list of vif objects
@@ -11,10 +11,10 @@ class Vif(object):
 	__hdr__ = (
 		("name", "32s", "-" * 32),
 		("ip", "4s", "\x00" * 4),
-		("mask", "4s", 0xffffff00),
+		("mask", "4s", "\x00" * 4),
 		("mac", "6s", "\x00" * 6),
-		("label", "4s", 0x0),
-		("cpus", "1s", 1),
+		("label", "4s", "\x00" *4),
+		("cpus", "1s", "\x00"),
 		("cpusets", "32s", "\x00" * 32),
 	)
 
@@ -34,7 +34,6 @@ class Vif(object):
 		if self.vifp is None:
 			print ("VIF creation failed")
 			return -1
-		print "[", self.vifp, "]"
 		VRFS_list.update( {self.path.strip() : self} )
 		return 0
 
@@ -45,9 +44,15 @@ class Vif(object):
 def vifdb_init(nbCores):
 	# Create socketServer for vif add/del listen.
 	try:
-		vif1 = Vif("vif-1" + " " * (32 - len("vif-1")) + "\xc0\xa8\01\02" + "\xff\xff\xff\x00" + "\xde\xad\xbe\xef\x01\x3c" + "\x00\x00\x00\x00" + "\x01" + "\x01" * 32)
+		vif1 = Vif("vif-1" + " " * (32 - len("vif-1")) + "\xc0\xa8\x01\x02" + \
+		           "\xff\xff\xff\x00" + "\xde\xad\xbe\xef\x01\x3c" + \
+		           "\x00\x00\x00\x00" + "\x01" + "\x01\x02\x03\x04" +\
+		           "\x00" * 28)
 		vif1.Create()
-		vif2 = Vif("vif-2" + " " * (32 - len("vif-1")) + "\xc0\xa8\01\03" + "\xff\xff\xff\x00" + "\xde\xad\xbe\xef\x01\x3d" + "\x00\x00\x00\x00" + "\x01" + "\x02" * 32)
+		vif2 = Vif("vif-2" + " " * (32 - len("vif-1")) + "\xc0\xa8\x01\x03" + \
+		           "\xff\xff\xff\x00" + "\xde\xad\xbe\xef\x01\x3d" \
+		           + "\x00\x00\x00\x00" + "\x01" + "\x02\x03\x04\x05" +\
+		           "\x00" * 28)
 		vif2.Create()
 	except:
 		return 0
